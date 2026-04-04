@@ -1,0 +1,30 @@
+{
+  "name": "dspy-slim",
+  "version": "0.1.0",
+  "description": "TypeScript port of DSPy — programming (not prompting) language models",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@ax-llm/ax": "^19.0.41",
+    "@types/node": "^25.5.2",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
