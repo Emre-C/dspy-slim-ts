@@ -1,6 +1,18 @@
 export type { FieldKind, TypeTag, Role, ModelType, AdapterKind } from './types.js';
 export { FIELD_KINDS, TYPE_TAGS, isFieldKind, isTypeTag } from './types.js';
 
+export { isObjectLike, isPlainObject } from './guards.js';
+
+export type { JSONSchemaType } from './codec.js';
+export {
+  coerceBoolean,
+  coerceNumber,
+  coerceJsonContainer,
+  coerceFieldValue,
+  typeTagToSchemaType,
+  schemaTypeToTypeTag,
+} from './codec.js';
+
 export type { Parameter } from './parameter.js';
 export { isParameter, markParameter } from './parameter.js';
 
@@ -13,6 +25,7 @@ export type { ParsedField, ParseResult, SignatureOptions } from './signature.js'
 export {
   Signature,
   createSignature,
+  ensureSignature,
   appendField,
   prependField,
   deleteField,
@@ -27,7 +40,13 @@ export {
 
 export { Example } from './example.js';
 
+export type { HistoryMessage } from './history.js';
+export { History, isHistoryLike } from './history.js';
+
 export { Completions, Prediction } from './prediction.js';
+
+export type { JSONSchema, ToolOptions, ToolCall } from './tool.js';
+export { Tool, ToolCalls } from './tool.js';
 
 export type {
   ContentPart,
@@ -55,6 +74,11 @@ export {
 
 export type { PredictTrace, PredictPreprocessResult } from './predict.js';
 export { Predict } from './predict.js';
+
+export { ChainOfThought } from './chain_of_thought.js';
+export { ReAct } from './react.js';
+
+export { ContextWindowExceededError, ValueError } from './exceptions.js';
 
 export type { SettingsOverrides, SettingsSnapshot } from './settings.js';
 export { Settings, settings } from './settings.js';

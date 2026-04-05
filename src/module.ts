@@ -5,24 +5,12 @@
  * future Predict can be both a Module and a Parameter without losing identity.
  */
 
+import { isObjectLike, isPlainObject } from './guards.js';
 import type { Prediction } from './prediction.js';
 import { type Parameter, isParameter, markParameter } from './parameter.js';
 import { settings } from './settings.js';
 
 const PREDICTOR_BRAND = Symbol('dspy.predictor');
-
-function isObjectLike(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (!isObjectLike(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
 
 function appendUnique<T extends object>(items: readonly T[], item: T): readonly T[] {
   return items.includes(item) ? items : Object.freeze([...items, item]);

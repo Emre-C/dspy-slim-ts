@@ -5,6 +5,7 @@
 import { Adapter, ChatAdapter, type Demo, JSONAdapter } from './adapter.js';
 import { Example } from './example.js';
 import { createField } from './field.js';
+import { isPlainObject } from './guards.js';
 import { BaseLM } from './lm.js';
 import { Module, markPredictor } from './module.js';
 import { snapshotRecord } from './owned_value.js';
@@ -13,7 +14,7 @@ import { settings } from './settings.js';
 import {
   Signature,
   createSignature,
-  signatureFromString,
+  ensureSignature,
 } from './signature.js';
 
 export interface PredictTrace {
@@ -32,27 +33,6 @@ export interface PredictPreprocessResult {
 
 const EMPTY_RECORD = Object.freeze({}) as Record<string, unknown>;
 const RESERVED_PREDICT_INPUT_KEYS = new Set(['signature', 'demos', 'config', 'lm']);
-
-function isObjectLike(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (!isObjectLike(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function ensureSignature(value: Signature | string): Signature {
-  if (value instanceof Signature) {
-    return value;
-  }
-
-  return signatureFromString(value);
-}
 
 function ensurePredictSignature(value: Signature | string): Signature {
   const signature = ensureSignature(value);

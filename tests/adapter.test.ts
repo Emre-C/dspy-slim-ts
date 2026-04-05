@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   AdapterParseError,
   ChatAdapter,
+  History,
   JSONAdapter,
   createField,
   createSignature,
@@ -183,5 +184,31 @@ describe('Adapter hardening', () => {
     expect(userMessages[0]).toContain('Incomplete question');
     expect(userMessages[1]).toContain('Complete question');
     expect(userMessages[2]).toContain('Current question');
+  });
+
+  it('formats conversation history before the current request when a history payload is present', () => {
+    const adapter = new ChatAdapter();
+    const signature = createSignature(
+      new Map([
+        ['question', createField({ kind: 'input', name: 'question' })],
+        ['history', createField({ kind: 'input', name: 'history', typeTag: 'custom', isTypeUndefined: false })],
+      ]),
+      new Map([
+        ['answer', createField({ kind: 'output', name: 'answer' })],
+      ]),
+    );
+
+    const messages = adapter.format(signature, [], {
+      question: 'Are you sure?',
+      history: new History([
+        { question: 'What is the capital of France?', answer: 'Paris' },
+      ]),
+    });
+
+    expect(messages.map((message) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(messages[1]?.content).toContain('What is the capital of France?');
+    expect(messages[2]?.content).toContain('Paris');
+    expect(messages[3]?.content).toContain('Are you sure?');
+    expect(messages[3]?.content).not.toContain('history');
   });
 });

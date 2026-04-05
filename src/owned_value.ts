@@ -1,17 +1,6 @@
+import { isObjectLike, isPlainObject } from './guards.js'
+
 type DictLike = Record<string, unknown>
-
-function isObjectLike(value: unknown): value is object {
-  return typeof value === 'object' && value !== null
-}
-
-function isPlainObject(value: unknown): value is DictLike {
-  if (!isObjectLike(value)) {
-    return false
-  }
-
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
-}
 
 function hasToDict(value: unknown): value is { toDict(): DictLike } {
   return isObjectLike(value) && 'toDict' in value && typeof value.toDict === 'function'

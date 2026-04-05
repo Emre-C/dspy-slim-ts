@@ -1,8 +1,6 @@
-const PARAMETER_BRAND = Symbol('dspy.parameter');
+import { isObjectLike } from './guards.js';
 
-function isObjectLike(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
+const PARAMETER_BRAND = Symbol('dspy.parameter');
 
 export interface Parameter {
   readonly [PARAMETER_BRAND]: true;

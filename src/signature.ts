@@ -479,6 +479,11 @@ export function parseSignature(input: string): ParseResult {
   return { inputs, outputs };
 }
 
+/** Normalise a Signature-or-string to a Signature. */
+export function ensureSignature(value: Signature | string): Signature {
+  return value instanceof Signature ? value : signatureFromString(value);
+}
+
 /** Convenience: parse a string and produce a full Signature. */
 export function signatureFromString(
   input: string,

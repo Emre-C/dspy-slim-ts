@@ -2,15 +2,18 @@
  * §5 — Adapter contract and message assembly.
  */
 
+import { coerceBoolean, coerceJsonContainer, coerceNumber } from './codec.js';
 import { Example } from './example.js';
 import type { Field } from './field.js';
+import { isPlainObject } from './guards.js';
+import { isHistoryLike } from './history.js';
 import type { BaseLM, LMOutput } from './lm.js';
 import {
   serializeOwnedValue,
   snapshotOwnedValue,
   snapshotRecord,
 } from './owned_value.js';
-import { Signature } from './signature.js';
+import { deleteField, Signature } from './signature.js';
 import type { Role, TypeTag } from './types.js';
 
 export interface ContentPart {
@@ -37,19 +40,6 @@ export interface AdapterOptions {
 }
 
 const FIELD_HEADER_RE = /^\[\[ ## (\w+) ## \]\]/;
-
-function isObjectLike(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (!isObjectLike(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
 
 function describeField(field: Field): string {
   const description = field.description.trim();
@@ -109,70 +99,17 @@ function toDemoRecord(demo: Demo): Record<string, unknown> {
   return demo instanceof Example ? demo.toDict() : snapshotRecord(demo);
 }
 
-function coerceBoolean(value: unknown): boolean {
-  if (typeof value === 'boolean') {
-    return value;
-  }
-
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    if (normalized === 'true') {
-      return true;
-    }
-    if (normalized === 'false') {
-      return false;
+function historyFieldName(
+  signature: Signature,
+  inputs: Record<string, unknown>,
+): string | null {
+  for (const [name] of signature.inputFields) {
+    if (isHistoryLike(inputs[name])) {
+      return name;
     }
   }
 
-  if (value === 1 || value === '1') {
-    return true;
-  }
-
-  if (value === 0 || value === '0') {
-    return false;
-  }
-
-  throw new Error(`Cannot coerce ${String(value)} to bool`);
-}
-
-function coerceNumber(value: unknown, kind: 'int' | 'float'): number {
-  const numeric = typeof value === 'number' ? value : Number(String(value).trim());
-
-  if (!Number.isFinite(numeric)) {
-    throw new Error(`Cannot coerce ${String(value)} to ${kind}`);
-  }
-
-  if (kind === 'int' && !Number.isInteger(numeric)) {
-    throw new Error(`Expected an integer, received ${String(value)}`);
-  }
-
-  return numeric;
-}
-
-function coerceJsonContainer(value: unknown, kind: 'list' | 'dict'): unknown {
-  if (kind === 'list' && Array.isArray(value)) {
-    return snapshotOwnedValue(value);
-  }
-
-  if (kind === 'dict' && isPlainObject(value)) {
-    return snapshotOwnedValue(value);
-  }
-
-  if (typeof value !== 'string') {
-    throw new Error(`Cannot coerce ${String(value)} to ${kind}`);
-  }
-
-  const parsed = JSON.parse(value);
-
-  if (kind === 'list' && Array.isArray(parsed)) {
-    return snapshotOwnedValue(parsed);
-  }
-
-  if (kind === 'dict' && isPlainObject(parsed)) {
-    return snapshotOwnedValue(parsed);
-  }
-
-  throw new Error(`Cannot coerce ${value} to ${kind}`);
+  return null;
 }
 
 function parseFieldValue(field: Field, value: unknown): unknown {
@@ -388,12 +325,17 @@ export abstract class Adapter {
     demos: readonly Demo[],
     inputs: Record<string, unknown>,
   ): Message[] {
+    const inputsCopy = snapshotRecord(inputs);
+    const historyName = historyFieldName(signature, inputsCopy);
+    const signatureWithoutHistory = historyName === null ? signature : deleteField(signature, historyName);
+
     return [
       { role: 'system', content: this.formatSystemMessage(signature) },
       ...this.formatDemos(signature, demos),
+      ...this.formatConversationHistory(signatureWithoutHistory, historyName, inputsCopy),
       {
         role: 'user',
-        content: this.formatUserMessageContent(signature, snapshotRecord(inputs), '', '', true),
+        content: this.formatUserMessageContent(signatureWithoutHistory, inputsCopy, '', '', true),
       },
     ];
   }
@@ -532,6 +474,36 @@ export abstract class Adapter {
       });
     }
 
+    return messages;
+  }
+
+  formatConversationHistory(
+    signature: Signature,
+    historyFieldNameValue: string | null,
+    inputs: Record<string, unknown>,
+  ): Message[] {
+    if (historyFieldNameValue === null) {
+      return [];
+    }
+
+    const history = inputs[historyFieldNameValue];
+    if (!isHistoryLike(history)) {
+      return [];
+    }
+
+    const messages: Message[] = [];
+    for (const entry of history.messages) {
+      messages.push({
+        role: 'user',
+        content: this.formatUserMessageContent(signature, entry),
+      });
+      messages.push({
+        role: 'assistant',
+        content: this.formatAssistantMessageContent(signature, entry),
+      });
+    }
+
+    delete inputs[historyFieldNameValue];
     return messages;
   }
 
