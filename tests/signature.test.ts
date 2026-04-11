@@ -66,14 +66,14 @@ interface OpsCase {
 
 const parseFixture: { cases: ParseCase[] } = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/signature_parse.json', import.meta.url),
+    new URL('../../spec/fixtures/signature_parse.json', import.meta.url),
     'utf-8',
   ),
 );
 
 const opsFixture: { cases: OpsCase[] } = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/signature_ops.json', import.meta.url),
+    new URL('../../spec/fixtures/signature_ops.json', import.meta.url),
     'utf-8',
   ),
 );

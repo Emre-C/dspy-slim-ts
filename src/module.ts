@@ -6,9 +6,13 @@
  */
 
 import { isObjectLike, isPlainObject } from './guards.js';
+import type { HistoryEntry } from './lm.js';
 import type { Prediction } from './prediction.js';
 import { type Parameter, isParameter, markParameter } from './parameter.js';
+import type { Callback } from './callback.js';
+import { runWithCallbacks, runWithCallbacksAsync } from './callback.js';
 import { settings } from './settings.js';
+import type { LMLike } from './types.js';
 
 const PREDICTOR_BRAND = Symbol('dspy.predictor');
 
@@ -56,6 +60,12 @@ function cloneValue<T>(value: T, seen: Map<object, unknown>): T {
     return clone as T;
   }
 
+  // Descriptor-copying opaque class instances breaks private slots and host
+  // resources. Only recurse into module nodes and plain data containers.
+  if (!(value instanceof BaseModule) && !isPlainObject(value)) {
+    return value;
+  }
+
   const clone = Object.create(Object.getPrototypeOf(value)) as Record<PropertyKey, unknown>;
   seen.set(value, clone);
 
@@ -84,7 +94,7 @@ function maybeResetParameter(parameter: Parameter): void {
 
 export interface PredictorLike extends Parameter {
   readonly [PREDICTOR_BRAND]: true;
-  lm: unknown | null;
+  lm: LMLike | null;
 }
 
 export function markPredictor<T extends BaseModule & object>(value: T): T & PredictorLike {
@@ -177,8 +187,8 @@ export abstract class BaseModule {
 
 export abstract class Module extends BaseModule {
   _compiled = false;
-  callbacks: unknown[] = [];
-  history: unknown[] = [];
+  callbacks: Callback[] = [];
+  history: HistoryEntry[] = [];
 
   abstract forward(kwargs: Record<string, unknown>): Prediction;
 
@@ -187,13 +197,27 @@ export abstract class Module extends BaseModule {
   }
 
   call(kwargs: Record<string, unknown>): Prediction {
-    const callerModules = appendUnique(settings.callerModules, this);
-    return settings.context({ callerModules }, () => this.forward(kwargs));
+    return runWithCallbacks({
+      kind: 'module',
+      instance: this,
+      inputs: kwargs,
+      execute: () => {
+        const callerModules = appendUnique(settings.callerModules, this);
+        return settings.context({ callerModules }, () => this.forward(kwargs));
+      },
+    });
   }
 
   async acall(kwargs: Record<string, unknown>): Promise<Prediction> {
-    const callerModules = appendUnique(settings.callerModules, this);
-    return settings.context({ callerModules }, () => this.aforward(kwargs));
+    return runWithCallbacksAsync({
+      kind: 'module',
+      instance: this,
+      inputs: kwargs,
+      execute: async () => {
+        const callerModules = appendUnique(settings.callerModules, this);
+        return settings.context({ callerModules }, () => this.aforward(kwargs));
+      },
+    });
   }
 
   namedPredictors(): Array<[string, BaseModule & PredictorLike]> {
@@ -206,13 +230,13 @@ export abstract class Module extends BaseModule {
     return this.namedPredictors().map(([, predictor]) => predictor);
   }
 
-  setLm(lm: unknown): void {
+  setLm(lm: LMLike): void {
     for (const predictor of this.predictors()) {
       predictor.lm = lm;
     }
   }
 
-  getLm(): unknown {
+  getLm(): LMLike | null {
     for (const predictor of this.predictors()) {
       if (predictor.lm !== null) {
         return predictor.lm;

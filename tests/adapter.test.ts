@@ -40,21 +40,21 @@ interface MessageAssemblyFixtureCase {
 
 const chatParseFixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/chat_adapter_parse.json', import.meta.url),
+    new URL('../../spec/fixtures/chat_adapter_parse.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: ChatParseFixtureCase[] };
 
 const jsonParseFixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/json_adapter_parse.json', import.meta.url),
+    new URL('../../spec/fixtures/json_adapter_parse.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: JsonParseFixtureCase[] };
 
 const messageAssemblyFixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/message_assembly.json', import.meta.url),
+    new URL('../../spec/fixtures/message_assembly.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: MessageAssemblyFixtureCase[] };
@@ -69,7 +69,7 @@ function createOutputOnlySignature(
       createField({
         kind: 'output',
         name,
-        typeTag: outputTypes[name],
+        ...(outputTypes[name] === undefined ? {} : { typeTag: outputTypes[name] }),
       }),
     ]),
   );

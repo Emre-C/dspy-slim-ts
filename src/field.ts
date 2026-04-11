@@ -13,6 +13,7 @@ import {
   type FieldKind,
   type TypeTag,
 } from './types.js';
+import { ValueError } from './exceptions.js';
 import { inferPrefix } from './infer_prefix.js';
 import { ownedValueEquals, snapshotOwnedValue } from './owned_value.js';
 
@@ -93,36 +94,36 @@ export class Field {
 
   static create(init: FieldInit): Field {
     if (!isFieldKind(init.kind)) {
-      throw new Error(`Invalid field kind "${String(init.kind)}"`);
+      throw new ValueError(`Invalid field kind "${String(init.kind)}"`);
     }
 
     if (!FIELD_NAME_RE.test(init.name)) {
-      throw new Error(
+      throw new ValueError(
         `Invalid field name "${init.name}": must match [a-zA-Z_][a-zA-Z0-9_]*`,
       );
     }
 
     if (init.isTypeUndefined === true && init.typeTag !== undefined) {
-      throw new Error(
+      throw new ValueError(
         `Field "${init.name}" cannot declare both typeTag and isTypeUndefined=true`,
       );
     }
 
     if (init.isTypeUndefined === false && init.typeTag === undefined) {
-      throw new Error(
+      throw new ValueError(
         `Field "${init.name}" cannot set isTypeUndefined=false without an explicit typeTag`,
       );
     }
 
     const typeTag = init.typeTag ?? 'str';
     if (!isTypeTag(typeTag)) {
-      throw new Error(`Invalid type tag "${String(typeTag)}" for field "${init.name}"`);
+      throw new ValueError(`Invalid type tag "${String(typeTag)}" for field "${init.name}"`);
     }
 
     const typeArgs = freezeArray(init.typeArgs, EMPTY_TYPE_ARGS);
     for (const typeArg of typeArgs) {
       if (!isTypeTag(typeArg)) {
-        throw new Error(
+        throw new ValueError(
           `Invalid type argument "${String(typeArg)}" for field "${init.name}"`,
         );
       }
@@ -131,7 +132,7 @@ export class Field {
     const constraints = freezeArray(init.constraints, EMPTY_CONSTRAINTS);
     const prefix = (init.prefix ?? inferPrefix(init.name)).trim();
     if (prefix === '') {
-      throw new Error(`Field "${init.name}" resolved to empty prefix`);
+      throw new ValueError(`Field "${init.name}" resolved to empty prefix`);
     }
 
     return new Field({

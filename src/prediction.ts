@@ -7,6 +7,7 @@
  *   - Completions: all arrays are the same length
  */
 
+import { KeyError, RuntimeError, ValueError } from './exceptions.js';
 import { serializeOwnedValue, snapshotOwnedValue, snapshotRecord } from './owned_value.js';
 import { Signature } from './signature.js';
 
@@ -41,7 +42,7 @@ function normalizeCompletionInput(
 
     for (const [index, completion] of completions.entries()) {
       if (completion === null || typeof completion !== 'object' || Array.isArray(completion)) {
-        throw new Error(
+        throw new ValueError(
           `Completion at index ${index} must be a plain object of field values`,
         );
       }
@@ -63,7 +64,7 @@ function normalizeCompletionInput(
 
   for (const [key, value] of Object.entries(completions)) {
     if (!Array.isArray(value)) {
-      throw new Error(`Completion field "${key}" must be an array of values`);
+      throw new ValueError(`Completion field "${key}" must be an array of values`);
     }
 
     normalized.set(key, value);
@@ -85,7 +86,7 @@ export class Completions {
     signature: Signature | null = null,
   ) {
     if (signature !== null && !(signature instanceof Signature)) {
-      throw new Error('Completions.signature must be a Signature or null');
+      throw new ValueError('Completions.signature must be a Signature or null');
     }
 
     // Validate: all arrays same length.
@@ -95,7 +96,7 @@ export class Completions {
       if (expectedLen === null) {
         expectedLen = arr.length;
       } else if (arr.length !== expectedLen) {
-        throw new Error(
+        throw new ValueError(
           `Completions array length mismatch: "${key}" has ${arr.length}, expected ${expectedLen}`,
         );
       }
@@ -141,7 +142,7 @@ export class Prediction {
   readonly completions: Completions | null;
   readonly #store: Map<string, unknown>;
 
-  private constructor(
+  protected constructor(
     data: Record<string, unknown>,
     completions: Completions | null,
   ) {
@@ -174,7 +175,7 @@ export class Prediction {
 
   get(key: string): unknown {
     if (!this.#store.has(key)) {
-      throw new Error(`Key "${key}" not found in Prediction`);
+      throw new KeyError(`Key "${key}" not found in Prediction`);
     }
 
     return this.#store.get(key);
@@ -223,16 +224,24 @@ export class Prediction {
     return this.toDict();
   }
 
+  snapshot(): Prediction {
+    if (this.completions === null) {
+      return Prediction.create(this.toDict());
+    }
+
+    return Prediction.fromCompletions(this.completions.toDict(), this.completions.signature);
+  }
+
   toFloat(): number {
     if (!this.has('score')) {
-      throw new Error(
+      throw new RuntimeError(
         'Prediction does not have a \'score\' field — cannot convert to number',
       );
     }
 
     const numericScore = Number(this.get('score'));
     if (Number.isNaN(numericScore)) {
-      throw new Error('Prediction score must be numeric to participate in numeric operations');
+      throw new ValueError('Prediction score must be numeric to participate in numeric operations');
     }
 
     return numericScore;
@@ -290,6 +299,7 @@ export class Prediction {
     return a >= b;
   }
 
+  /** Predictions never have input keys (spec S6). Duck-type compat with Example. */
   hasInputKeys(): false {
     return false;
   }

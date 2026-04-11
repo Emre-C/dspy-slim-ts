@@ -33,3 +33,13 @@ export type Role = 'system' | 'user' | 'assistant' | 'developer';
 export type ModelType = 'chat' | 'responses';
 
 export type AdapterKind = 'chat' | 'json';
+
+/** Structural minimum for objects stored as the LM in settings. */
+export interface LMLike {
+  readonly model: string;
+}
+
+/** Structural minimum for objects stored as the adapter in settings. */
+export interface AdapterLike {
+  readonly useNativeFunctionCalling: boolean;
+}

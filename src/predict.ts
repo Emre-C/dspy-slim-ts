@@ -3,6 +3,7 @@
  */
 
 import { Adapter, ChatAdapter, type Demo, JSONAdapter } from './adapter.js';
+import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
 import { Example } from './example.js';
 import { createField } from './field.js';
 import { isPlainObject } from './guards.js';
@@ -41,7 +42,7 @@ function ensurePredictSignature(value: Signature | string): Signature {
   ));
 
   if (reservedInputs.length > 0) {
-    throw new Error(
+    throw new ValueError(
       `Predict input field names are reserved for control overrides: ${reservedInputs.join(', ')}.`,
     );
   }
@@ -55,7 +56,7 @@ function normalizeConfig(value: unknown): Record<string, unknown> {
   }
 
   if (!isPlainObject(value)) {
-    throw new Error('Predict config must be a plain object');
+    throw new ValueError('Predict config must be a plain object');
   }
 
   return snapshotRecord(value);
@@ -152,7 +153,7 @@ export class Predict extends Module {
         return ensurePredictSignature(provided);
       }
 
-      throw new Error('Predict signature override must be a Signature or string');
+      throw new ValueError('Predict signature override must be a Signature or string');
     }
 
     return this.signature;
@@ -162,7 +163,7 @@ export class Predict extends Module {
     if (!(kwargs.demos === undefined)) {
       const provided = kwargs.demos;
       if (!Array.isArray(provided)) {
-        throw new Error('Predict demos override must be an array');
+        throw new ValueError('Predict demos override must be an array');
       }
 
       return normalizeDemos(provided as readonly Demo[]);
@@ -183,15 +184,15 @@ export class Predict extends Module {
     const candidate = directLm ?? this.lm ?? settings.lm;
 
     if (candidate === null || candidate === undefined) {
-      throw new Error('No LM is loaded.');
+      throw new ConfigurationError('No LM is loaded.');
     }
 
     if (typeof candidate === 'string') {
-      throw new Error('Predict LM must be an instance of BaseLM, not a string.');
+      throw new ValueError('Predict LM must be an instance of BaseLM, not a string.');
     }
 
     if (!(candidate instanceof BaseLM)) {
-      throw new Error(`Predict LM must be an instance of BaseLM, received ${typeof candidate}.`);
+      throw new ValueError(`Predict LM must be an instance of BaseLM, received ${typeof candidate}.`);
     }
 
     return candidate;
@@ -204,7 +205,7 @@ export class Predict extends Module {
     }
 
     if (!(configured instanceof Adapter)) {
-      throw new Error('settings.adapter must be an Adapter instance');
+      throw new RuntimeError('settings.adapter must be an Adapter instance');
     }
 
     return configured;
@@ -320,11 +321,11 @@ export class Predict extends Module {
     positionalArgs: readonly unknown[],
   ): Record<string, unknown> {
     if (positionalArgs.length > 0) {
-      throw new Error(this.positionalArgsErrorMessage());
+      throw new ValueError(this.positionalArgsErrorMessage());
     }
 
     if (!isPlainObject(kwargs)) {
-      throw new Error(this.positionalArgsErrorMessage());
+      throw new ValueError(this.positionalArgsErrorMessage());
     }
 
     return snapshotRecord(kwargs);

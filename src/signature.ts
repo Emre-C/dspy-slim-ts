@@ -10,6 +10,8 @@
  */
 
 import { Field, createField } from './field.js';
+import { InvariantError, ValueError } from './exceptions.js';
+import { splitTopLevel } from './split.js';
 import { isTypeTag, type FieldKind, type TypeTag } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -38,17 +40,17 @@ function cloneValidatedFieldMap(
 
   for (const [key, field] of fields) {
     if (!(field instanceof Field)) {
-      throw new Error(`Field map entry "${key}" is not a Field instance`);
+      throw new InvariantError(`Field map entry "${key}" is not a Field instance`);
     }
 
     if (field.name !== key) {
-      throw new Error(
+      throw new InvariantError(
         `Field map key "${key}" does not match field.name "${field.name}"`,
       );
     }
 
     if (field.kind !== expectedKind) {
-      throw new Error(
+      throw new InvariantError(
         `Field "${key}" has kind "${field.kind}" but is stored in ${expectedKind}Fields`,
       );
     }
@@ -57,77 +59,6 @@ function cloneValidatedFieldMap(
   }
 
   return cloned;
-}
-
-function splitTopLevel(input: string, delimiter: string): string[] {
-  const parts: string[] = [];
-  const stack: string[] = [];
-  let activeQuote: string | null = null;
-  let escaping = false;
-  let start = 0;
-
-  for (let i = 0; i < input.length; i++) {
-    const char = input[i]!;
-
-    if (activeQuote !== null) {
-      if (escaping) {
-        escaping = false;
-        continue;
-      }
-
-      if (char === '\\') {
-        escaping = true;
-        continue;
-      }
-
-      if (char === activeQuote) {
-        activeQuote = null;
-      }
-
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      activeQuote = char;
-      continue;
-    }
-
-    if (char === '[' || char === '(' || char === '{') {
-      stack.push(char);
-      continue;
-    }
-
-    if (char === ']' || char === ')' || char === '}') {
-      const open = stack.pop();
-      const matches =
-        (char === ']' && open === '[')
-        || (char === ')' && open === '(')
-        || (char === '}' && open === '{');
-
-      if (!matches) {
-        throw new Error(`Malformed signature: mismatched delimiter in "${input}"`);
-      }
-
-      continue;
-    }
-
-    if (stack.length === 0 && input.startsWith(delimiter, i)) {
-      parts.push(input.slice(start, i));
-      start = i + delimiter.length;
-      i += delimiter.length - 1;
-    }
-  }
-
-  if (activeQuote !== null) {
-    throw new Error(`Malformed signature: unterminated string literal in "${input}"`);
-  }
-
-  if (stack.length > 0) {
-    throw new Error(`Malformed signature: unbalanced delimiters in "${input}"`);
-  }
-
-  parts.push(input.slice(start));
-  return parts;
 }
 
 function assertDistinctFieldNames(
@@ -139,7 +70,7 @@ function assertDistinctFieldNames(
 
   for (const field of fields) {
     if (seen.has(field.name)) {
-      throw new Error(
+      throw new ValueError(
         `Duplicate ${groupLabel} field "${field.name}" in signature "${source}"`,
       );
     }
@@ -153,22 +84,22 @@ function parseFieldList(raw: string, kind: FieldKind): readonly ParsedField[] {
     return [];
   }
 
-  return splitTopLevel(raw, ',').map((segment) => {
+  return splitTopLevel(raw, ',', true).map((segment) => {
     const trimmed = segment.trim();
     if (trimmed === '') {
-      throw new Error('Signature contains an empty field segment');
+      throw new ValueError('Signature contains an empty field segment');
     }
 
-    const fieldParts = splitTopLevel(trimmed, ':');
+    const fieldParts = splitTopLevel(trimmed, ':', true);
     if (fieldParts.length > 2) {
-      throw new Error(`Field "${trimmed}" contains multiple type separators`);
+      throw new ValueError(`Field "${trimmed}" contains multiple type separators`);
     }
 
     if (fieldParts.length === 2) {
       const name = fieldParts[0]!.trim();
       const rawType = fieldParts[1]!.trim();
       if (rawType === '') {
-        throw new Error(`Field "${name}" is missing a type annotation`);
+        throw new ValueError(`Field "${name}" is missing a type annotation`);
       }
 
       const bracketIndex = rawType.indexOf('[');
@@ -202,11 +133,11 @@ function normalizeFieldForInsertion(
   }
 
   if (kind === undefined || typeTag === undefined) {
-    throw new Error('append/prepend requires either a Field or name+kind+typeTag');
+    throw new ValueError('append/prepend requires either a Field or name+kind+typeTag');
   }
 
   if (!isTypeTag(typeTag)) {
-    throw new Error(`Invalid type tag "${String(typeTag)}"`);
+    throw new ValueError(`Invalid type tag "${String(typeTag)}"`);
   }
 
   return createField({
@@ -246,7 +177,7 @@ export class Signature {
 
     for (const key of clonedInputs.keys()) {
       if (clonedOutputs.has(key)) {
-        throw new Error(
+        throw new InvariantError(
           `Field "${key}" appears in both input and output fields (disjoint invariant violated)`,
         );
       }
@@ -363,7 +294,7 @@ export function deleteField(sig: Signature, fieldName: string): Signature {
   const deletedOutput = newOutputs.delete(fieldName);
 
   if (!deletedInput && !deletedOutput) {
-    throw new Error(`Field "${fieldName}" not found in signature`);
+    throw new ValueError(`Field "${fieldName}" not found in signature`);
   }
 
   return createSignature(newInputs, newOutputs, {
@@ -396,7 +327,7 @@ export function withUpdatedField(
   } else if (newOutputs.has(fieldName)) {
     newOutputs.set(fieldName, field);
   } else {
-    throw new Error(`Field "${fieldName}" not found in signature`);
+    throw new ValueError(`Field "${fieldName}" not found in signature`);
   }
 
   return createSignature(newInputs, newOutputs, {
@@ -453,9 +384,9 @@ export interface ParseResult {
 }
 
 export function parseSignature(input: string): ParseResult {
-  const arrowParts = splitTopLevel(input, '->');
+  const arrowParts = splitTopLevel(input, '->', true);
   if (arrowParts.length !== 2) {
-    throw new Error(
+    throw new ValueError(
       `Signature must contain exactly one '->': got "${input}"`,
     );
   }
@@ -470,7 +401,7 @@ export function parseSignature(input: string): ParseResult {
   const inputNames = new Set(inputs.map((f) => f.name));
   for (const out of outputs) {
     if (inputNames.has(out.name)) {
-      throw new Error(
+      throw new ValueError(
         `Input and output fields must have distinct names: "${out.name}" appears in both`,
       );
     }

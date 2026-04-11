@@ -2,14 +2,53 @@
  * Shared runtime exceptions.
  */
 
-export class ValueError extends Error {
-  constructor(message: string) {
+export class DSPyError extends Error {
+  constructor(name: string, message: string) {
     super(message);
-    this.name = 'ValueError';
+    this.name = name;
   }
 }
 
-export class ContextWindowExceededError extends Error {
+export class ValueError extends DSPyError {
+  constructor(message: string) {
+    super('ValueError', message);
+  }
+}
+
+export class KeyError extends DSPyError {
+  constructor(message: string) {
+    super('KeyError', message);
+  }
+}
+
+export class RuntimeError extends DSPyError {
+  constructor(message: string) {
+    super('RuntimeError', message);
+  }
+}
+
+export class BudgetError extends ValueError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BudgetError';
+  }
+}
+
+export class ConfigurationError extends ValueError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigurationError';
+  }
+}
+
+export class InvariantError extends RuntimeError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvariantError';
+  }
+}
+
+export class ContextWindowExceededError extends RuntimeError {
   readonly model: string | null;
 
   constructor(options: { readonly model?: string | null; readonly message?: string } = {}) {

@@ -2,6 +2,7 @@
  * §7.3 — History: immutable conversation history payload.
  */
 
+import { ValueError } from './exceptions.js';
 import { isPlainObject } from './guards.js';
 import { serializeOwnedValue, snapshotRecord } from './owned_value.js';
 
@@ -23,12 +24,12 @@ export class History {
 
   constructor(messages: readonly HistoryMessage[]) {
     if (!Array.isArray(messages)) {
-      throw new Error('History messages must be an array');
+      throw new ValueError('History messages must be an array');
     }
 
     this.messages = Object.freeze(messages.map((message, index) => {
       if (!isPlainObject(message)) {
-        throw new Error(`History message at index ${index} must be a plain object`);
+        throw new ValueError(`History message at index ${index} must be a plain object`);
       }
 
       return Object.freeze(snapshotRecord(message));

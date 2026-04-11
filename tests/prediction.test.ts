@@ -20,7 +20,7 @@ interface FixtureCase {
 const fixture = JSON.parse(
   readFileSync(
     new URL(
-      '../../dspy-slim/spec/fixtures/prediction_ops.json',
+      '../../spec/fixtures/prediction_ops.json',
       import.meta.url,
     ),
     'utf-8',
@@ -161,8 +161,8 @@ describe('Prediction hardening', () => {
     const pred = Prediction.create({ answer: 'Paris', score: 0.5 });
 
     expect(Number(pred)).toBe(0.5);
-    expect(pred > 0.4).toBe(true);
-    expect(Math.max(pred, 0.4)).toBe(0.5);
+    expect(Number(pred) > 0.4).toBe(true);
+    expect(Math.max(Number(pred), 0.4)).toBe(0.5);
     expect(`${pred}`).toBe('Prediction({"answer":"Paris","score":0.5})');
   });
 

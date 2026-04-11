@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AxSignature } from '@ax-llm/ax';
 
-const FIXTURES = resolve(import.meta.dirname, '../../dspy-slim/spec/fixtures');
+const FIXTURES = resolve(import.meta.dirname, '../../spec/fixtures');
 
 /**
  * Attempt to call AX and return its result, or null if AX rejects the input.

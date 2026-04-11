@@ -14,6 +14,7 @@ import {
   snapshotRecord,
   snapshotOwnedValue,
 } from './owned_value.js';
+import { KeyError, RuntimeError } from './exceptions.js';
 
 const DSPY_PREFIX_RE = /^dspy_/;
 
@@ -31,7 +32,7 @@ export class Example {
 
   get(key: string): unknown {
     if (!this._store.has(key)) {
-      throw new Error(`Key "${key}" not found in Example`);
+      throw new KeyError(`Key "${key}" not found in Example`);
     }
     return this._store.get(key);
   }
@@ -73,7 +74,7 @@ export class Example {
 
   inputs(): Example {
     if (this._inputKeys === null) {
-      throw new Error('Inputs have not been set — call withInputs() first');
+      throw new RuntimeError('Inputs have not been set — call withInputs() first');
     }
     const data: Record<string, unknown> = {};
     for (const k of this._inputKeys) {
@@ -86,7 +87,7 @@ export class Example {
 
   labels(): Example {
     if (this._inputKeys === null) {
-      throw new Error('Inputs have not been set — call withInputs() first');
+      throw new RuntimeError('Inputs have not been set — call withInputs() first');
     }
     const data: Record<string, unknown> = {};
     for (const [k, v] of this._store) {
@@ -107,6 +108,10 @@ export class Example {
 
   toJSON(): Record<string, unknown> {
     return this.toDict();
+  }
+
+  snapshot(): Example {
+    return new Example(this.toDict(), this._inputKeys);
   }
 
   copy(overrides?: Record<string, unknown>): Example {

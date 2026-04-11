@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.env
 
 # Local agent instructions (contains internal design rationale not for public consumption)
 AGENTS.md

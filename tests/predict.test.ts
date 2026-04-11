@@ -69,9 +69,43 @@ class TestLM extends BaseLM {
   }
 }
 
+class SequenceLM extends BaseLM {
+  readonly outputsByCall: readonly (readonly LMOutput[])[];
+  readonly calls: Array<{
+    readonly messages: readonly Message[] | undefined;
+    readonly kwargs: Record<string, unknown>;
+  }> = [];
+
+  constructor(
+    outputsByCall: readonly (readonly LMOutput[])[],
+    model = 'openrouter/minimax/minimax-m2.7',
+  ) {
+    super({ model });
+    this.outputsByCall = outputsByCall;
+  }
+
+  protected override generate(
+    _prompt?: string,
+    messages?: readonly Message[],
+    kwargs: Record<string, unknown> = {},
+  ): readonly LMOutput[] {
+    this.calls.push({
+      messages,
+      kwargs: { ...kwargs },
+    });
+
+    const outputs = this.outputsByCall[this.calls.length - 1];
+    if (!outputs) {
+      throw new Error('SequenceLM ran out of scripted outputs');
+    }
+
+    return outputs;
+  }
+}
+
 const fixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/predict_pipeline.json', import.meta.url),
+    new URL('../../spec/fixtures/predict_pipeline.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: PredictPipelineFixtureCase[] };
@@ -253,5 +287,47 @@ describe('Predict hardening', () => {
     expect(() => predict.preprocess({ signature: 'lm -> answer' })).toThrow(
       'reserved for control overrides',
     );
+  });
+
+  it('retries OpenRouter Minimax structured-output failures with minimal hidden reasoning', () => {
+    const lm = new SequenceLM([
+      ['{}'],
+      ['{"answer":"Paris"}'],
+    ]);
+    const predict = new Predict('question -> answer');
+    predict.lm = lm;
+
+    const result = predict.forward({ question: 'What is the capital of France?' });
+
+    expect(result.toDict()).toEqual({ answer: 'Paris' });
+    expect(lm.calls).toHaveLength(2);
+    expect(lm.calls[0]?.kwargs.extra_body).toBeUndefined();
+    expect(lm.calls[1]?.kwargs.extra_body).toEqual({
+      reasoning: {
+        exclude: true,
+        effort: 'minimal',
+      },
+    });
+  });
+
+  it('does not override explicit MiniMax reasoning configuration during structured-output retries', () => {
+    const lm = new SequenceLM([
+      ['{}'],
+    ]);
+    const predict = new Predict('question -> answer');
+    predict.lm = lm;
+
+    expect(() => predict.forward({
+      question: 'What is the capital of France?',
+      config: {
+        extra_body: {
+          reasoning: {
+            exclude: true,
+            effort: 'high',
+          },
+        },
+      },
+    })).toThrow('Expected fields answer');
+    expect(lm.calls).toHaveLength(1);
   });
 });

@@ -1,4 +1,4 @@
-export type { FieldKind, TypeTag, Role, ModelType, AdapterKind } from './types.js';
+export type { FieldKind, TypeTag, Role, ModelType, AdapterKind, LMLike, AdapterLike } from './types.js';
 export { FIELD_KINDS, TYPE_TAGS, isFieldKind, isTypeTag } from './types.js';
 
 export { isObjectLike, isPlainObject } from './guards.js';
@@ -17,6 +17,9 @@ export type { Parameter } from './parameter.js';
 export { isParameter, markParameter } from './parameter.js';
 
 export { inferPrefix } from './infer_prefix.js';
+
+export type { Callback } from './callback.js';
+export { BaseCallback, currentCallID } from './callback.js';
 
 export type { FieldInit } from './field.js';
 export { Field, createField } from './field.js';
@@ -61,8 +64,21 @@ export {
   JSONAdapter,
 } from './adapter.js';
 
-export type { BaseLMOptions, LMOutput, LMOutputEnvelope, HistoryEntry } from './lm.js';
-export { BaseLM } from './lm.js';
+export type {
+  BaseLMOptions,
+  LMOptions,
+  LMResponse,
+  ChatCompletionResponse,
+  ResponsesResponse,
+  LMOutput,
+  LMOutputEnvelope,
+  HistoryEntry,
+  ToolCallWire,
+} from './lm.js';
+export { BaseLM, LM, getGlobalHistory, resetGlobalHistory } from './lm.js';
+
+export type { GoldenTranscriptEntry } from './replay_lm.js';
+export { ReplayLM } from './replay_lm.js';
 
 export type { PredictorLike } from './module.js';
 export {
@@ -75,10 +91,94 @@ export {
 export type { PredictTrace, PredictPreprocessResult } from './predict.js';
 export { Predict } from './predict.js';
 
+export type {
+  ParallelOptions,
+  ParallelCallable,
+  ParallelInput,
+  ParallelTarget,
+  ParallelExecPair,
+  ParallelResults,
+  ParallelFailureBundle,
+  ParallelForwardResult,
+} from './parallel.js';
+export { Parallel } from './parallel.js';
+
+export type {
+  EvaluationScore,
+  EvaluationRow,
+  EvaluationMetric,
+  EvaluateProgram,
+  EvaluateOptions,
+  EvaluateCallOptions,
+} from './evaluate.js';
+export { Evaluate, EvaluationResult } from './evaluate.js';
+
 export { ChainOfThought } from './chain_of_thought.js';
 export { ReAct } from './react.js';
+export type {
+  BudgetVector,
+  CodeInterpreterError,
+  REPLVariable,
+  REPLEntryKind,
+  REPLEntry,
+  REPLHistory,
+  InterpreterPatch,
+  ExecuteRequest,
+  FinalOutput,
+  ExecuteResult,
+  CodeSession,
+  CodeInterpreter,
+  LLMQueryRequest,
+  LLMQueryResult,
+  RLMConfig,
+  RLMRunResult,
+} from './rlm_types.js';
+export { NodeCodeInterpreter, createNodeCodeInterpreter } from './node_code_interpreter.js';
+export type { NodeCodeInterpreterOptions, SyncCodeInterpreter, SyncCodeSession } from './node_code_interpreter.js';
+export type { RLMOptions } from './rlm.js';
+export { RLM } from './rlm.js';
+export type {
+  PredictorTarget,
+  MetricRecord,
+  PredictorTrace,
+  ReflectiveDatum,
+  InstructionCell,
+  ProgramProjection,
+  CandidateVector,
+  InstructionProposal,
+  OptimizationArtifact,
+  GEPAEngineRequest,
+  GEPAEngineResult,
+  GEPAEngine,
+  GEPAAdapter,
+  GEPAConfig,
+  GEPACompileResult,
+} from './gepa_types.js';
+export {
+  normalizeMetricRecord,
+  projectPredictorTargets,
+  capturePredictorTraces,
+  materializeReflectiveDataset,
+  ensureNonEmptyTargets,
+} from './gepa_trace.js';
+export {
+  GEPA,
+  createGatedGEPAEngine,
+  createStaticGEPAEngine,
+  createModuleGEPAAdapter,
+  getOptimizationArtifact,
+} from './gepa.js';
 
-export { ContextWindowExceededError, ValueError } from './exceptions.js';
+export {
+  DSPyError,
+  ValueError,
+  BudgetError,
+  KeyError,
+  RuntimeError,
+  ConfigurationError,
+  InvariantError,
+  ContextWindowExceededError,
+} from './exceptions.js';
 
 export type { SettingsOverrides, SettingsSnapshot } from './settings.js';
 export { Settings, settings } from './settings.js';

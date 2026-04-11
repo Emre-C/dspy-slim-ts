@@ -9,7 +9,7 @@ interface InferPrefixCase {
 
 const fixture: { cases: InferPrefixCase[] } = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/infer_prefix.json', import.meta.url),
+    new URL('../../spec/fixtures/infer_prefix.json', import.meta.url),
     'utf-8',
   ),
 );

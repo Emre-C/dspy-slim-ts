@@ -27,7 +27,7 @@ interface FixtureCase {
 
 const fixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/example_ops.json', import.meta.url),
+    new URL('../../spec/fixtures/example_ops.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: FixtureCase[] };

@@ -12,12 +12,19 @@ import {
   schemaTypeToTypeTag,
   typeTagToSchemaType,
 } from './codec.js';
+import type { Callback } from './callback.js';
+import { runWithCallbacks, runWithCallbacksAsync } from './callback.js';
 import { ValueError } from './exceptions.js';
 import { isPlainObject } from './guards.js';
+import { splitTopLevel } from './split.js';
 import { serializeOwnedValue, snapshotRecord } from './owned_value.js';
 import type { TypeTag } from './types.js';
-type ToolFunction = (...args: any[]) => unknown;
+
+type ToolFunction = (...args: never[]) => unknown;
 type InvokeMode = 'positional' | 'record';
+type SyncToolResult<TFunc extends ToolFunction> = ReturnType<TFunc> extends Promise<unknown>
+  ? never
+  : ReturnType<TFunc>;
 
 export interface JSONSchema {
   readonly type?: JSONSchemaType;
@@ -33,6 +40,7 @@ export interface ToolOptions {
   readonly desc?: string;
   readonly args?: Readonly<Record<string, JSONSchema>>;
   readonly argTypes?: Readonly<Record<string, TypeTag>>;
+  readonly callbacks?: readonly Callback[];
 }
 
 export interface ToolCall {
@@ -44,57 +52,11 @@ interface ParameterSpec {
   readonly name: string;
 }
 
-function splitTopLevel(input: string): string[] {
-  const parts: string[] = [];
-  const stack: string[] = [];
-  let activeQuote: string | null = null;
-  let escaping = false;
-  let start = 0;
-
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index]!;
-
-    if (activeQuote !== null) {
-      if (escaping) {
-        escaping = false;
-        continue;
-      }
-
-      if (char === '\\') {
-        escaping = true;
-        continue;
-      }
-
-      if (char === activeQuote) {
-        activeQuote = null;
-      }
-
-      continue;
-    }
-
-    if (char === '"' || char === "'" || char === '`') {
-      activeQuote = char;
-      continue;
-    }
-
-    if (char === '(' || char === '{' || char === '[') {
-      stack.push(char);
-      continue;
-    }
-
-    if (char === ')' || char === '}' || char === ']') {
-      stack.pop();
-      continue;
-    }
-
-    if (char === ',' && stack.length === 0) {
-      parts.push(input.slice(start, index));
-      start = index + 1;
-    }
-  }
-
-  parts.push(input.slice(start));
-  return parts;
+function invokeToolFunction<TFunc extends ToolFunction>(
+  func: TFunc,
+  args: readonly unknown[],
+): ReturnType<TFunc> {
+  return Reflect.apply(func as Function, undefined, args) as ReturnType<TFunc>;
 }
 
 function parameterListFromSource(source: string): string | null {
@@ -150,7 +112,7 @@ function inferParameters(func: ToolFunction): readonly ParameterSpec[] {
     const withoutRest = raw.replace(/^\.\.\./, '').trim();
     const name = withoutRest.split('=')[0]!.trim();
     if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
-      throw new Error(
+      throw new ValueError(
         'Tool parameters must be simple identifiers unless explicit args metadata is provided.',
       );
     }
@@ -254,19 +216,26 @@ function formatArgSchemas(args: Readonly<Record<string, JSONSchema>>): string {
   return JSON.stringify(args, null, 2);
 }
 
-export class Tool {
-  readonly func: ToolFunction;
+function isPromiseLike(value: unknown): value is Promise<unknown> {
+  return value instanceof Promise;
+}
+
+export class Tool<TFunc extends ToolFunction = ToolFunction> {
+  readonly func: TFunc;
   readonly name: string;
   readonly desc: string;
   readonly args: Readonly<Record<string, JSONSchema>>;
   readonly argTypes: Readonly<Record<string, TypeTag>>;
   readonly hasKwargs: boolean;
+  readonly callbacks: readonly Callback[];
 
+  readonly #runtimeFunc: TFunc;
   readonly #argOrder: readonly string[];
   readonly #invokeMode: InvokeMode;
 
-  constructor(func: ToolFunction, options: ToolOptions = {}) {
+  constructor(func: TFunc, options: ToolOptions = {}) {
     this.func = func;
+    this.#runtimeFunc = func;
 
     let inferredParameters: readonly ParameterSpec[] = Object.freeze([]);
     try {
@@ -278,7 +247,7 @@ export class Tool {
     const argNames = normalizeArgNames(inferredParameters, options.args, options.argTypes);
     const explicitArgMetadataCount = Object.keys(options.args ?? {}).length + Object.keys(options.argTypes ?? {}).length;
     if (argNames.length === 0 && explicitArgMetadataCount > 0) {
-      throw new Error('Tool metadata must declare at least one argument name when args or argTypes are provided.');
+      throw new ValueError('Tool metadata must declare at least one argument name when args or argTypes are provided.');
     }
 
     const resolvedName = options.name ?? func.name ?? '';
@@ -288,26 +257,41 @@ export class Tool {
     this.args = Object.freeze(normalizeArgs(argNames, options.args, options.argTypes));
     this.argTypes = Object.freeze(normalizeArgTypes(argNames, this.args, options.argTypes));
     this.hasKwargs = false;
+    this.callbacks = Object.freeze([...(options.callbacks ?? [])]);
     this.#argOrder = argNames;
     this.#invokeMode = inferredParameters.length > 0 ? 'positional' : 'record';
   }
 
-  call(kwargs: Record<string, unknown> = {}): unknown {
-    const parsedKwargs = this.validateAndParseArgs(kwargs);
-    const result = this.invoke(parsedKwargs);
+  call(kwargs: Record<string, unknown> = {}): SyncToolResult<TFunc> {
+    return runWithCallbacks({
+      kind: 'tool',
+      instance: this,
+      inputs: snapshotRecord(kwargs),
+      execute: () => {
+        const parsedKwargs = this.validateAndParseArgs(kwargs);
+        const result = this.invoke(parsedKwargs);
 
-    if (result instanceof Promise) {
-      throw new ValueError(
-        'You are calling `call` on an async tool; use `acall` instead.',
-      );
-    }
+        if (isPromiseLike(result)) {
+          throw new ValueError(
+            'You are calling `call` on an async tool; use `acall` instead.',
+          );
+        }
 
-    return result;
+        return result as SyncToolResult<TFunc>;
+      },
+    });
   }
 
-  async acall(kwargs: Record<string, unknown> = {}): Promise<unknown> {
-    const parsedKwargs = this.validateAndParseArgs(kwargs);
-    return this.invoke(parsedKwargs);
+  async acall(kwargs: Record<string, unknown> = {}): Promise<Awaited<ReturnType<TFunc>>> {
+    return runWithCallbacksAsync({
+      kind: 'tool',
+      instance: this,
+      inputs: snapshotRecord(kwargs),
+      execute: async (): Promise<Awaited<ReturnType<TFunc>>> => {
+        const parsedKwargs = this.validateAndParseArgs(kwargs);
+        return await Promise.resolve(this.invoke(parsedKwargs));
+      },
+    });
   }
 
   formatAsOpenAIFunctionCall(): {
@@ -362,19 +346,33 @@ export class Tool {
     return snapshotRecord(parsedKwargs);
   }
 
-  private invoke(kwargs: Record<string, unknown>): unknown {
+  private invoke(kwargs: Record<string, unknown>): ReturnType<TFunc> {
     if (this.#invokeMode === 'record') {
-      return this.func(snapshotRecord(kwargs));
+      return invokeToolFunction(this.#runtimeFunc, [snapshotRecord(kwargs)]);
     }
 
     const positionalArgs = this.#argOrder.map((name) => kwargs[name]);
-    return this.func(...positionalArgs);
+    return invokeToolFunction(this.#runtimeFunc, positionalArgs);
   }
 }
 
 function normalizeToolCall(value: unknown): ToolCall {
   if (!isPlainObject(value)) {
     throw new ValueError(`Received invalid value for ToolCalls: ${String(value)}`);
+  }
+
+  if ('function' in value && isPlainObject(value.function)) {
+    const name = value.function.name;
+    const rawArguments = value.function.arguments;
+    const args = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
+    if (typeof name !== 'string' || !isPlainObject(args)) {
+      throw new ValueError(`Received invalid value for ToolCalls: ${JSON.stringify(value)}`);
+    }
+
+    return Object.freeze({
+      name,
+      args: snapshotRecord(args),
+    });
   }
 
   const name = value.name;
@@ -420,6 +418,10 @@ export class ToolCalls {
     }
 
     throw new ValueError(`Received invalid value for ToolCalls: ${JSON.stringify(value)}`);
+  }
+
+  snapshot(): ToolCalls {
+    return new ToolCalls(this.toolCalls);
   }
 
   format(): { tool_calls: ReadonlyArray<{ readonly type: 'function'; readonly function: { readonly name: string; readonly arguments: Record<string, unknown> } }> } {

@@ -1,4 +1,5 @@
 import { isObjectLike } from './guards.js';
+import { ValueError } from './exceptions.js';
 
 const PARAMETER_BRAND = Symbol('dspy.parameter');
 
@@ -8,7 +9,7 @@ export interface Parameter {
 
 export function markParameter<T extends object>(value: T): T & Parameter {
   if (!isObjectLike(value)) {
-    throw new Error('Only objects can be marked as Parameters');
+    throw new ValueError('Only objects can be marked as Parameters');
   }
 
   if (!isParameter(value)) {

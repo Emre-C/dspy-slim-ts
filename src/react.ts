@@ -24,7 +24,7 @@ const MAX_TRUNCATION_ATTEMPTS = 3;
 const TRAJECTORY_KEYS_PER_STEP = 4;
 const RESERVED_REACT_INPUT_KEYS = new Set(['trajectory', 'max_iters']);
 
-type ToolInput = Tool | ((...args: any[]) => unknown);
+type ToolInput = Tool | ((...args: unknown[]) => unknown);
 
 interface ReActStep {
   readonly nextThought: string;
@@ -54,7 +54,7 @@ function cloneField(field: Field, kind = field.kind): Field {
 function ensureReactCompatibleSignature(signature: Signature): Signature {
   const reservedInputs = [...signature.inputFields.keys()].filter((name) => RESERVED_REACT_INPUT_KEYS.has(name));
   if (reservedInputs.length > 0) {
-    throw new Error(`ReAct input field names are reserved for control flow: ${reservedInputs.join(', ')}.`);
+    throw new ValueError(`ReAct input field names are reserved for control flow: ${reservedInputs.join(', ')}.`);
   }
 
   return signature;
@@ -66,11 +66,11 @@ function normalizeTools(tools: readonly ToolInput[]): Map<string, Tool> {
   for (const candidate of tools) {
     const tool = candidate instanceof Tool ? candidate : new Tool(candidate);
     if (tool.name === 'finish') {
-      throw new Error('ReAct tool name "finish" is reserved.');
+      throw new ValueError('ReAct tool name "finish" is reserved.');
     }
 
     if (normalized.has(tool.name)) {
-      throw new Error(`Duplicate ReAct tool name: ${tool.name}`);
+      throw new ValueError(`Duplicate ReAct tool name: ${tool.name}`);
     }
 
     normalized.set(tool.name, tool);
@@ -287,14 +287,14 @@ export class ReAct extends Module {
     readonly maxIters: number;
   } {
     if (!isPlainObject(kwargs)) {
-      throw new Error('ReAct expects a single plain-object argument.');
+      throw new ValueError('ReAct expects a single plain-object argument.');
     }
 
     const raw = snapshotRecord(kwargs);
     const rawMaxIters = raw.max_iters;
     const maxIters = rawMaxIters === undefined ? this.maxIters : Number(rawMaxIters);
     if (!Number.isInteger(maxIters) || maxIters < 0) {
-      throw new Error('ReAct max_iters override must be a non-negative integer.');
+      throw new ValueError('ReAct max_iters override must be a non-negative integer.');
     }
 
     const { max_iters: _discard, ...inputArgs } = raw;

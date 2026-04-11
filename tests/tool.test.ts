@@ -1,7 +1,31 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import { Tool, ToolCalls, ValueError } from '../src/index.js';
 
 describe('Tool', () => {
+  it('preserves callable and return types on the public Tool surface', () => {
+    const positionalTool = new Tool((city: string, unit: string) => `${city}:${unit}`);
+    const recordTool = new Tool(async ({ city, days }: { city: string; days: number }) => (
+      `${city}:${days}`
+    ), {
+      args: {
+        city: { type: 'string' },
+        days: { type: 'integer' },
+      },
+      argTypes: {
+        city: 'str',
+        days: 'int',
+      },
+    });
+
+    expectTypeOf(positionalTool.func).parameters.toEqualTypeOf<[string, string]>();
+    expectTypeOf(positionalTool.func).returns.toEqualTypeOf<string>();
+    expectTypeOf(positionalTool.call).returns.toEqualTypeOf<string>();
+
+    expectTypeOf(recordTool.func).parameters.toEqualTypeOf<[{ city: string; days: number }]>();
+    expectTypeOf(recordTool.func).returns.toEqualTypeOf<Promise<string>>();
+    expectTypeOf(recordTool.acall).returns.toEqualTypeOf<Promise<string>>();
+  });
+
   it('infers a usable tool shape from a plain function and executes named args in order', () => {
     function lookup(city: string, unit: string) {
       return `${city}:${unit}`;
@@ -87,5 +111,16 @@ describe('ToolCalls', () => {
         },
       ],
     });
+  });
+
+  it('survives owned-value snapshots as a ToolCalls instance', () => {
+    const toolCalls = ToolCalls.from({
+      tool_calls: [
+        { name: 'search', args: { query: 'weather' } },
+      ],
+    });
+
+    expect(toolCalls.snapshot()).toBeInstanceOf(ToolCalls);
+    expect(toolCalls.snapshot().toolCalls).toEqual(toolCalls.toolCalls);
   });
 });

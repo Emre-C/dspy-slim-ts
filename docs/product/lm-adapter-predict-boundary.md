@@ -48,7 +48,8 @@ also handles input defaults, warnings for missing or extra inputs, temperature
 auto-adjust behavior, and trace storage.
 
 Control keys such as `signature`, `demos`, `config`, and `lm` are reserved for
-Predict overrides and should not double as user input field names.
+Predict overrides and should not double as user input field names. Signatures
+that use those names as input fields are rejected eagerly.
 
 ## Durability Notes
 

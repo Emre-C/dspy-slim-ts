@@ -7,7 +7,11 @@ import {
 } from '../src/module.js';
 import { signatureFromString } from '../src/signature.js';
 
-type FixtureValue = FixtureNode | FixtureValue[] | Record<string, FixtureValue>;
+interface FixtureRecord {
+  readonly [key: string]: FixtureValue;
+}
+
+type FixtureValue = FixtureNode | readonly FixtureValue[] | FixtureRecord;
 
 interface FixtureNode {
   type: 'Module' | 'Predict' | 'ChainOfThought' | 'ReAct';
@@ -26,10 +30,17 @@ interface FixtureCase {
 }
 
 class ModuleFixture extends Module {
-  override forward(): Prediction {
+  override forward(_kwargs: Record<string, unknown> = {}): Prediction {
     return Prediction.create({});
   }
 }
+
+type ModuleFixtureWithInner = ModuleFixture & { inner?: Predict };
+type ModuleFixtureWithPredictors = ModuleFixture & {
+  predictor?: Predict;
+  nested?: ModuleFixtureWithInner;
+  predict?: Predict;
+};
 
 class Predict extends Module {
   signature;
@@ -49,7 +60,7 @@ class Predict extends Module {
     this.traces = [];
   }
 
-  override forward(): Prediction {
+  override forward(_kwargs: Record<string, unknown> = {}): Prediction {
     return Prediction.create({});
   }
 }
@@ -114,7 +125,7 @@ function buildNode(node: FixtureNode, shared: Map<string, unknown>): Module {
       instance = new ReAct();
       break;
     default:
-      throw new Error(`Unknown fixture node type: ${(node as FixtureNode).type}`);
+      throw new Error(`Unknown fixture node type: ${node.type}`);
   }
 
   if (node.id) {
@@ -125,7 +136,7 @@ function buildNode(node: FixtureNode, shared: Map<string, unknown>): Module {
 
   if (node.attrs) {
     for (const [key, value] of Object.entries(node.attrs)) {
-      (instance as Record<string, unknown>)[key] = buildValue(value, shared);
+      Reflect.set(instance, key, buildValue(value, shared));
     }
   }
 
@@ -134,7 +145,7 @@ function buildNode(node: FixtureNode, shared: Map<string, unknown>): Module {
 
 const fixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/module_tree_walk.json', import.meta.url),
+    new URL('../../spec/fixtures/module_tree_walk.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: FixtureCase[] };
@@ -166,8 +177,8 @@ describe('Module tree walk (spec fixtures)', () => {
 describe('Module hardening', () => {
   it('treats predictor identity as terminal during parameter traversal', () => {
     const predict = new Predict('question -> answer');
-    const wrapper = new ModuleFixture();
-    const nested = new ModuleFixture();
+    const wrapper = new ModuleFixture() as ModuleFixtureWithPredictors;
+    const nested = new ModuleFixture() as ModuleFixtureWithInner;
 
     nested.inner = predict;
     wrapper.predictor = predict;
@@ -177,7 +188,7 @@ describe('Module hardening', () => {
   });
 
   it('resetCopy deep-clones the module graph and resets parameterized leaves', () => {
-    const root = new ModuleFixture();
+    const root = new ModuleFixture() as ModuleFixtureWithPredictors;
     const predict = new Predict('question -> answer');
     predict.lm = { id: 'lm-a' };
     predict.demos = [{ question: 'Why?' }];

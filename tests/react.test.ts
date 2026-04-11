@@ -37,10 +37,15 @@ interface ReactFixtureCase {
   expected_react_outputs?: string[];
 }
 
-interface QueueEntry {
-  readonly type: 'output' | 'error';
-  readonly value: string | Error;
-}
+type QueueEntry =
+  | {
+    readonly type: 'output';
+    readonly value: LMOutput;
+  }
+  | {
+    readonly type: 'error';
+    readonly value: Error;
+  };
 
 class QueueLM extends BaseLM {
   readonly queue: QueueEntry[];
@@ -73,7 +78,7 @@ class QueueLM extends BaseLM {
 
 const fixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/react_state_machine.json', import.meta.url),
+    new URL('../../spec/fixtures/react_state_machine.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: ReactFixtureCase[] };

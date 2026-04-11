@@ -1,136 +1,161 @@
-import { isObjectLike, isPlainObject } from './guards.js'
+/**
+ * Shared owned-value snapshot and serialization helpers.
+ *
+ * These helpers keep copy, persistence, and equality semantics aligned across
+ * the runtime so callers do not have to reimplement cloning rules.
+ */
 
-type DictLike = Record<string, unknown>
+import { isObjectLike, isPlainObject } from './guards.js';
+
+type DictLike = Record<string, unknown>;
+
+interface SnapshotCapableOwnedValue {
+  snapshot(): unknown;
+}
+
+function hasSnapshot(value: unknown): value is SnapshotCapableOwnedValue {
+  return isObjectLike(value) && 'snapshot' in value && typeof value.snapshot === 'function';
+}
 
 function hasToDict(value: unknown): value is { toDict(): DictLike } {
-  return isObjectLike(value) && 'toDict' in value && typeof value.toDict === 'function'
+  return isObjectLike(value) && 'toDict' in value && typeof value.toDict === 'function';
 }
 
 function snapshotPlainObject(value: DictLike): DictLike {
-  const snapshot: DictLike = {}
+  const snapshot: DictLike = {};
 
   for (const [key, item] of Object.entries(value)) {
-    snapshot[key] = snapshotOwnedValue(item)
+    snapshot[key] = snapshotOwnedValue(item);
   }
 
-  return Object.freeze(snapshot)
+  return Object.freeze(snapshot);
 }
 
 function serializePlainObject(value: DictLike): DictLike {
-  const serialized: DictLike = {}
+  const serialized: DictLike = {};
 
   for (const [key, item] of Object.entries(value)) {
-    serialized[key] = serializeOwnedValue(item)
+    serialized[key] = serializeOwnedValue(item);
   }
 
-  return serialized
+  return serialized;
 }
 
 export function snapshotOwnedValue(value: unknown): unknown {
   if (!isObjectLike(value)) {
-    return value
+    return value;
   }
 
   if (value instanceof Date) {
-    return new Date(value.getTime())
+    return new Date(value.getTime());
   }
 
   if (Array.isArray(value)) {
-    return Object.freeze(value.map((item) => snapshotOwnedValue(item)))
+    return Object.freeze(value.map((item) => snapshotOwnedValue(item)));
+  }
+
+  if (hasSnapshot(value)) {
+    return value.snapshot();
   }
 
   if (hasToDict(value)) {
-    return snapshotPlainObject(value.toDict())
+    return snapshotPlainObject(value.toDict());
   }
 
   if (isPlainObject(value)) {
-    return snapshotPlainObject(value)
+    return snapshotPlainObject(value);
   }
 
-  return value
+  return value;
 }
 
 export function snapshotRecord(record: DictLike | undefined): DictLike {
   if (record === undefined) {
-    return {}
+    return {};
   }
 
-  const snapshot: DictLike = {}
+  const snapshot: DictLike = {};
 
   for (const [key, value] of Object.entries(record)) {
-    snapshot[key] = snapshotOwnedValue(value)
+    snapshot[key] = snapshotOwnedValue(value);
   }
 
-  return snapshot
+  return snapshot;
 }
 
 export function serializeOwnedValue(value: unknown): unknown {
   if (!isObjectLike(value)) {
-    return value
+    return value;
   }
 
   if (value instanceof Date) {
-    return new Date(value.getTime())
+    return new Date(value.getTime());
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => serializeOwnedValue(item))
+    return value.map((item) => serializeOwnedValue(item));
   }
 
   if (hasToDict(value)) {
-    return serializePlainObject(value.toDict())
+    return serializePlainObject(value.toDict());
   }
 
   if (isPlainObject(value)) {
-    return serializePlainObject(value)
+    return serializePlainObject(value);
   }
 
-  return value
+  return value;
 }
 
 export function ownedValueEquals(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) {
-    return true
+    return true;
   }
 
   if (a instanceof Date && b instanceof Date) {
-    return a.getTime() === b.getTime()
+    return a.getTime() === b.getTime();
   }
 
   if (Array.isArray(a) && Array.isArray(b)) {
     if (a.length !== b.length) {
-      return false
+      return false;
     }
 
     for (let i = 0; i < a.length; i++) {
       if (!ownedValueEquals(a[i], b[i])) {
-        return false
+        return false;
       }
     }
 
-    return true
+    return true;
+  }
+
+  if (hasToDict(a) || hasToDict(b)) {
+    const left = hasToDict(a) ? a.toDict() : a;
+    const right = hasToDict(b) ? b.toDict() : b;
+    return ownedValueEquals(left, right);
   }
 
   if (isPlainObject(a) && isPlainObject(b)) {
-    const aKeys = Object.keys(a)
-    const bKeys = Object.keys(b)
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
 
     if (aKeys.length !== bKeys.length) {
-      return false
+      return false;
     }
 
     for (const key of aKeys) {
       if (!(key in b)) {
-        return false
+        return false;
       }
 
       if (!ownedValueEquals(a[key], b[key])) {
-        return false
+        return false;
       }
     }
 
-    return true
+    return true;
   }
 
-  return false
+  return false;
 }

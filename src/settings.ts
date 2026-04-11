@@ -6,32 +6,35 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { BaseModule } from './module.js';
+import type { Callback } from './callback.js';
+import { RuntimeError } from './exceptions.js';
+import type { Module } from './module.js';
+import type { AdapterLike, LMLike } from './types.js';
 
 function freezeList<T>(items: readonly T[] | undefined): readonly T[] {
   return Object.freeze([...(items ?? [])]);
 }
 
 export interface SettingsSnapshot {
-  readonly lm: unknown | null;
-  readonly adapter: unknown | null;
+  readonly lm: LMLike | null;
+  readonly adapter: AdapterLike | null;
   readonly numThreads: number;
   readonly maxErrors: number;
   readonly disableHistory: boolean;
   readonly maxHistorySize: number;
-  readonly callbacks: readonly unknown[];
-  readonly callerModules: readonly BaseModule[];
+  readonly callbacks: readonly Callback[];
+  readonly callerModules: readonly Module[];
 }
 
 export interface SettingsOverrides {
-  readonly lm?: unknown | null;
-  readonly adapter?: unknown | null;
+  readonly lm?: LMLike | null;
+  readonly adapter?: AdapterLike | null;
   readonly numThreads?: number;
   readonly maxErrors?: number;
   readonly disableHistory?: boolean;
   readonly maxHistorySize?: number;
-  readonly callbacks?: readonly unknown[];
-  readonly callerModules?: readonly BaseModule[];
+  readonly callbacks?: readonly Callback[];
+  readonly callerModules?: readonly Module[];
 }
 
 interface SettingsContextState {
@@ -46,8 +49,8 @@ const DEFAULT_SETTINGS: SettingsSnapshot = Object.freeze({
   maxErrors: 10,
   disableHistory: false,
   maxHistorySize: 10000,
-  callbacks: freezeList(undefined),
-  callerModules: freezeList(undefined) as readonly BaseModule[],
+  callbacks: freezeList<Callback>(undefined),
+  callerModules: freezeList<Module>(undefined),
 });
 
 function mergeSettings(
@@ -82,7 +85,7 @@ export class Settings {
     const threadId = this.currentThreadId();
 
     if (this.#ownerThreadId !== null && this.#ownerThreadId !== threadId) {
-      throw new Error('RuntimeError: settings.configure() is owned by another thread');
+      throw new RuntimeError('settings.configure() is owned by another thread');
     }
 
     this.#ownerThreadId = threadId;
@@ -119,11 +122,11 @@ export class Settings {
     return this.snapshot()[key];
   }
 
-  get lm(): unknown | null {
+  get lm(): LMLike | null {
     return this.snapshot().lm;
   }
 
-  get adapter(): unknown | null {
+  get adapter(): AdapterLike | null {
     return this.snapshot().adapter;
   }
 
@@ -143,11 +146,11 @@ export class Settings {
     return this.snapshot().maxHistorySize;
   }
 
-  get callbacks(): readonly unknown[] {
+  get callbacks(): readonly Callback[] {
     return this.snapshot().callbacks;
   }
 
-  get callerModules(): readonly BaseModule[] {
+  get callerModules(): readonly Module[] {
     return this.snapshot().callerModules;
   }
 

@@ -3,6 +3,9 @@
  */
 
 import { coerceBoolean, coerceJsonContainer, coerceNumber } from './codec.js';
+import type { Callback } from './callback.js';
+import { runWithCallbacks } from './callback.js';
+import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
 import { Example } from './example.js';
 import type { Field } from './field.js';
 import { isPlainObject } from './guards.js';
@@ -13,7 +16,8 @@ import {
   snapshotOwnedValue,
   snapshotRecord,
 } from './owned_value.js';
-import { deleteField, Signature } from './signature.js';
+import { deleteField, Signature, signatureString } from './signature.js';
+import { Tool, ToolCalls } from './tool.js';
 import type { Role, TypeTag } from './types.js';
 
 export interface ContentPart {
@@ -35,8 +39,15 @@ export interface Message {
 export type Demo = Example | Record<string, unknown>;
 
 export interface AdapterOptions {
-  readonly callbacks?: readonly unknown[];
+  readonly callbacks?: readonly Callback[];
   readonly useNativeFunctionCalling?: boolean;
+}
+
+interface AdapterCallPreprocessResult {
+  readonly signature: Signature;
+  readonly inputs: Record<string, unknown>;
+  readonly lmKwargs: Record<string, unknown>;
+  readonly toolOutputFieldName: string | null;
 }
 
 const FIELD_HEADER_RE = /^\[\[ ## (\w+) ## \]\]/;
@@ -140,12 +151,12 @@ function assertExactOutputKeys(
   expectedKeys: readonly string[],
 ): void {
   if (actualKeys.length !== expectedKeys.length) {
-    throw new Error(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
+    throw new ValueError(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
   }
 
   for (let index = 0; index < expectedKeys.length; index += 1) {
     if (actualKeys[index] !== expectedKeys[index]) {
-      throw new Error(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
+      throw new ValueError(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
     }
   }
 }
@@ -156,6 +167,34 @@ function extractLmOutputText(output: LMOutput): string {
   }
 
   return output.text;
+}
+
+function isToolOutputEnvelope(output: LMOutput): output is Exclude<LMOutput, string> {
+  return typeof output !== 'string';
+}
+
+function outputToolFieldName(signature: Signature): string | null {
+  if (signature.outputFields.has('tool_calls')) {
+    return 'tool_calls';
+  }
+
+  if (signature.outputFields.has('toolCalls')) {
+    return 'toolCalls';
+  }
+
+  return null;
+}
+
+function normalizeNativeTools(value: unknown): readonly Tool[] | null {
+  if (value instanceof Tool) {
+    return Object.freeze([value]);
+  }
+
+  if (Array.isArray(value) && value.length > 0 && value.every((item) => item instanceof Tool)) {
+    return Object.freeze([...value]);
+  }
+
+  return null;
 }
 
 function tryParseJson(candidate: string): unknown {
@@ -261,7 +300,59 @@ function parseLooseJsonObject(source: string): Record<string, unknown> | null {
   return null;
 }
 
-export class AdapterParseError extends Error {
+function isOpenRouterMinimaxModel(model: string): boolean {
+  return model.toLowerCase().startsWith('openrouter/minimax/');
+}
+
+function hasExplicitOpenRouterMinimaxReasoningOverride(
+  lmKwargs: Record<string, unknown>,
+): boolean {
+  if (lmKwargs.reasoning !== undefined) {
+    return true;
+  }
+
+  const extraBody = isPlainObject(lmKwargs.extra_body)
+    ? lmKwargs.extra_body
+    : isPlainObject(lmKwargs.extraBody)
+      ? lmKwargs.extraBody
+      : null;
+
+  return isPlainObject(extraBody) && extraBody.reasoning !== undefined;
+}
+
+function shouldRetryWithOpenRouterMinimaxFallback(
+  lm: BaseLM,
+  lmKwargs: Record<string, unknown>,
+  error: unknown,
+): error is AdapterParseError {
+  return error instanceof AdapterParseError
+    && isOpenRouterMinimaxModel(lm.model)
+    && !hasExplicitOpenRouterMinimaxReasoningOverride(lmKwargs);
+}
+
+function withOpenRouterMinimaxMinimalReasoning(
+  lmKwargs: Record<string, unknown>,
+): Record<string, unknown> {
+  const nextKwargs = snapshotRecord(lmKwargs);
+  const extraBody = isPlainObject(nextKwargs.extra_body)
+    ? snapshotRecord(nextKwargs.extra_body)
+    : isPlainObject(nextKwargs.extraBody)
+      ? snapshotRecord(nextKwargs.extraBody)
+      : {};
+
+  delete nextKwargs.extraBody;
+  nextKwargs.extra_body = snapshotRecord({
+    ...extraBody,
+    reasoning: {
+      exclude: true,
+      effort: 'minimal',
+    },
+  });
+
+  return nextKwargs;
+}
+
+export class AdapterParseError extends RuntimeError {
   readonly adapterName: string;
   readonly signature: Signature;
   readonly completion: string;
@@ -286,7 +377,7 @@ export class AdapterParseError extends Error {
 }
 
 export abstract class Adapter {
-  readonly callbacks: readonly unknown[];
+  readonly callbacks: readonly Callback[];
   readonly useNativeFunctionCalling: boolean;
 
   protected constructor(options: AdapterOptions = {}) {
@@ -301,10 +392,27 @@ export abstract class Adapter {
     demos: readonly Demo[],
     inputs: Record<string, unknown>,
   ): Record<string, unknown>[] {
-    const messages = this.format(signature, demos, inputs);
-    const outputs = lm.call(undefined, messages, snapshotRecord(lmKwargs));
+    const processed = this.preprocessCall(lm, lmKwargs, signature, inputs);
+    const messages = this.formatWithCallbacks(processed.signature, demos, processed.inputs);
+    const parseOutputs = (currentLmKwargs: Record<string, unknown>): Record<string, unknown>[] => {
+      const outputs = lm.call(undefined, messages, currentLmKwargs);
+      return outputs.map((output) => this.postprocessOutput(
+        processed.signature,
+        signature,
+        processed.toolOutputFieldName,
+        output,
+      ));
+    };
 
-    return outputs.map((output) => this.parse(signature, extractLmOutputText(output)));
+    try {
+      return parseOutputs(processed.lmKwargs);
+    } catch (error) {
+      if (!shouldRetryWithOpenRouterMinimaxFallback(lm, processed.lmKwargs, error)) {
+        throw error;
+      }
+      return parseOutputs(withOpenRouterMinimaxMinimalReasoning(processed.lmKwargs));
+
+    }
   }
 
   async acall(
@@ -314,10 +422,26 @@ export abstract class Adapter {
     demos: readonly Demo[],
     inputs: Record<string, unknown>,
   ): Promise<Record<string, unknown>[]> {
-    const messages = this.format(signature, demos, inputs);
-    const outputs = await lm.acall(undefined, messages, snapshotRecord(lmKwargs));
+    const processed = this.preprocessCall(lm, lmKwargs, signature, inputs);
+    const messages = this.formatWithCallbacks(processed.signature, demos, processed.inputs);
+    const parseOutputs = async (currentLmKwargs: Record<string, unknown>): Promise<Record<string, unknown>[]> => {
+      const outputs = await lm.acall(undefined, messages, currentLmKwargs);
+      return outputs.map((output) => this.postprocessOutput(
+        processed.signature,
+        signature,
+        processed.toolOutputFieldName,
+        output,
+      ));
+    };
 
-    return outputs.map((output) => this.parse(signature, extractLmOutputText(output)));
+    try {
+      return await parseOutputs(processed.lmKwargs);
+    } catch (error) {
+      if (!shouldRetryWithOpenRouterMinimaxFallback(lm, processed.lmKwargs, error)) {
+        throw error;
+      }
+      return parseOutputs(withOpenRouterMinimaxMinimalReasoning(processed.lmKwargs));
+    }
   }
 
   format(
@@ -508,6 +632,137 @@ export abstract class Adapter {
   }
 
   abstract parse(signature: Signature, completion: string): Record<string, unknown>;
+
+  private formatWithCallbacks(
+    signature: Signature,
+    demos: readonly Demo[],
+    inputs: Record<string, unknown>,
+  ): Message[] {
+    return runWithCallbacks({
+      kind: 'adapter_format',
+      instance: this,
+      inputs: snapshotRecord({ signature: signatureString(signature), inputs, demos }),
+      execute: () => this.format(signature, demos, inputs),
+    });
+  }
+
+  private parseWithCallbacks(signature: Signature, completion: string): Record<string, unknown> {
+    return runWithCallbacks({
+      kind: 'adapter_parse',
+      instance: this,
+      inputs: { signature: signatureString(signature), completion },
+      execute: () => this.parse(signature, completion),
+    });
+  }
+
+  private preprocessCall(
+    lm: BaseLM,
+    lmKwargs: Record<string, unknown>,
+    signature: Signature,
+    inputs: Record<string, unknown>,
+  ): AdapterCallPreprocessResult {
+    const nextInputs = snapshotRecord(inputs);
+    const nextLmKwargs = snapshotRecord(lmKwargs);
+    let processedSignature = signature;
+    const toolOutputFieldName = outputToolFieldName(signature);
+
+    if (!this.useNativeFunctionCalling) {
+      return {
+        signature: processedSignature,
+        inputs: nextInputs,
+        lmKwargs: nextLmKwargs,
+        toolOutputFieldName: null,
+      };
+    }
+
+    let toolInputFieldName: string | null = null;
+    let tools = normalizeNativeTools(nextLmKwargs.tools);
+
+    if (tools === null) {
+      for (const [name] of signature.inputFields) {
+        const candidate = normalizeNativeTools(nextInputs[name]);
+        if (candidate !== null) {
+          toolInputFieldName = name;
+          tools = candidate;
+          break;
+        }
+      }
+    }
+
+    if (tools === null) {
+      return {
+        signature: processedSignature,
+        inputs: nextInputs,
+        lmKwargs: nextLmKwargs,
+        toolOutputFieldName: null,
+      };
+    }
+
+    if (!lm.supportsFunctionCalling) {
+      throw new ConfigurationError('Native function calling requires an LM that supports function calling.');
+    }
+
+    if (toolOutputFieldName === null) {
+      throw new ValueError('Native function calling requires an output field named tool_calls or toolCalls.');
+    }
+
+    nextLmKwargs.tools = tools.map((tool) => tool.formatAsOpenAIFunctionCall());
+
+    if (toolInputFieldName !== null) {
+      processedSignature = deleteField(processedSignature, toolInputFieldName);
+      delete nextInputs[toolInputFieldName];
+    }
+    processedSignature = deleteField(processedSignature, toolOutputFieldName);
+
+    return {
+      signature: processedSignature,
+      inputs: nextInputs,
+      lmKwargs: nextLmKwargs,
+      toolOutputFieldName,
+    };
+  }
+
+  private postprocessOutput(
+    processedSignature: Signature,
+    originalSignature: Signature,
+    toolOutputFieldName: string | null,
+    output: LMOutput,
+  ): Record<string, unknown> {
+    const parsed: Record<string, unknown> = {};
+    const text = extractLmOutputText(output).trim();
+    const toolCalls = isToolOutputEnvelope(output) ? output.toolCalls : undefined;
+
+    if (text !== '') {
+      Object.assign(parsed, this.parseWithCallbacks(processedSignature, text));
+    } else if (!(toolCalls && toolCalls.length > 0)) {
+      throw new AdapterParseError({
+        adapterName: this.constructor.name,
+        signature: originalSignature,
+        completion: text,
+        message: 'The LM returned an empty or null response.',
+      });
+    }
+
+    for (const [name] of originalSignature.outputFields) {
+      if (!(name in parsed)) {
+        parsed[name] = null;
+      }
+    }
+
+    if (toolOutputFieldName !== null) {
+      parsed[toolOutputFieldName] = toolCalls ? ToolCalls.from(toolCalls) : null;
+    }
+
+    if (isToolOutputEnvelope(output) && output.logprobs !== undefined) {
+      parsed.logprobs = output.logprobs;
+    }
+
+    if (isToolOutputEnvelope(output) && output.citations !== undefined) {
+      parsed.citations = snapshotOwnedValue(output.citations);
+    }
+
+    return Object.freeze({ ...parsed });
+  }
 }
 
 export class ChatAdapter extends Adapter {

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import type { Callback } from '../src/callback.js';
+import { Module } from '../src/module.js';
+import { Prediction } from '../src/prediction.js';
 import { Settings } from '../src/settings.js';
 
 interface FixtureOp {
@@ -16,9 +19,22 @@ interface FixtureCase {
   ops: FixtureOp[];
 }
 
+class SettingsModule extends Module {
+  readonly id: string;
+
+  constructor(id: string) {
+    super();
+    this.id = id;
+  }
+
+  override forward(_kwargs: Record<string, unknown> = {}): Prediction {
+    return Prediction.create({});
+  }
+}
+
 const fixture = JSON.parse(
   readFileSync(
-    new URL('../../dspy-slim/spec/fixtures/settings_behavior.json', import.meta.url),
+    new URL('../../spec/fixtures/settings_behavior.json', import.meta.url),
     'utf-8',
   ),
 ) as { cases: FixtureCase[] };
@@ -101,29 +117,34 @@ describe('Settings behavior (spec fixtures)', () => {
 describe('Settings hardening', () => {
   it('context inherits the current thread identity while overriding selected keys', () => {
     const settings = new Settings();
+    const lmA = { model: 'lm-a' };
+    const lmB = { model: 'lm-b' };
+    const adapterA = { useNativeFunctionCalling: false };
+    const adapterB = { useNativeFunctionCalling: true };
 
     settings.withThread(7, () => {
-      settings.configure({ lm: 'lm-a', adapter: 'adapter-a' });
-      settings.context({ lm: 'lm-b' }, () => {
-        expect(settings.lm).toBe('lm-b');
-        expect(settings.adapter).toBe('adapter-a');
-        settings.configure({ adapter: 'adapter-b' });
+      settings.configure({ lm: lmA, adapter: adapterA });
+      settings.context({ lm: lmB }, () => {
+        expect(settings.lm).toBe(lmB);
+        expect(settings.adapter).toBe(adapterA);
+        settings.configure({ adapter: adapterB });
       });
-      expect(settings.adapter).toBe('adapter-b');
+      expect(settings.adapter).toBe(adapterB);
     });
   });
 
   it('defensively owns callback and caller module lists', () => {
     const settings = new Settings();
-    const callbacks = [{ name: 'cb' }];
-    const modules = [{ id: 'module-a' }] as never[];
+    const callbacks: Callback[] = [{}];
+    const modules = [new SettingsModule('module-a')];
 
     settings.configure({ callbacks, callerModules: modules });
-    callbacks.push({ name: 'mutated' });
-    modules.push({ id: 'module-b' } as never);
+    callbacks.push({});
+    modules.push(new SettingsModule('module-b'));
 
-    expect(settings.callbacks).toEqual([{ name: 'cb' }]);
-    expect(settings.callerModules).toEqual([{ id: 'module-a' }]);
+    expect(settings.callbacks).toEqual([callbacks[0]]);
+    expect(settings.callerModules).toHaveLength(1);
+    expect(settings.callerModules[0]).toBe(modules[0]);
     expect(() => (settings.callbacks as unknown[]).push({ name: 'x' })).toThrow();
   });
 });

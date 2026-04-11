@@ -7,7 +7,7 @@ Accepted.
 ## Decision
 
 The authoritative behavior for this project comes from
-`dspy-slim/spec/abstractions.md` and our spec fixtures, not from AX.
+`spec/abstractions.md` (workspace root) and our spec fixtures, not from AX.
 
 AX is used only as an oracle-style compatibility report in
 `tests/ax_oracle.test.ts`.
