@@ -59,3 +59,4 @@ those, and the document itself should be stable enough not to need them.
 - [Provider Profile Boundary](./provider-profile-boundary.md)
 - [Type-Level Signature Inference](./type-level-signature-inference.md)
 - [Release Gate Pack Tooling](./release-gate-pack-tooling.md) — why `pack:dry-run` uses pnpm while the automated gate uses `npm pack --json`
+- [RLM v2 Architecture](./rlm-v2-architecture.md) — typed combinator runtime, deterministic planner, effects handler, typed memory reinjection; supersedes the v1 REPL contract

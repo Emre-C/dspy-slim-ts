@@ -2,6 +2,36 @@
 
 An opinionated TypeScript port of `dspy-slim`, which itself is a slimmed down version of the upstream infamous DSPy framework.
 
+## Breaking changes (v0.2.0)
+
+`RLM` is rewritten end-to-end. The REPL / `eval` / `node:vm` runtime is gone; in its place is a typed functional runtime built on four first-class pillars. Consumers of any `v0.1.x` tarball will see compilation errors on their first install after upgrading; migration is mechanical and worth it.
+
+What changed:
+
+- `RLM.forward()` **throws** `RuntimeError('RLM is async-only. Use acall() or aforward() instead.')`, matching `LM`. Use `await rlm.aforward({ ... })`.
+- `NodeCodeInterpreter`, `createNodeCodeInterpreter`, and the REPL types (`REPLHistory`, `REPLEntry`, `REPLEntryKind`, `REPLVariable`, `CodeSession`, `CodeInterpreter`, `ExecuteRequest`, `ExecuteResult`, `InterpreterPatch`, `CodeInterpreterError`, `BudgetVector`, `LLMQueryRequest`, `LLMQueryResult`, `RLMConfig`) are **removed** from the public surface.
+- The new public surface is the typed combinator runtime (`split`, `peek`, `map`, `filter`, `reduce`, `concat`, `cross`, `vote`, `ensemble`, `oracle`, `lit`, `vref`, `fn`, `bop`), the evaluator (`evaluate`, `buildEvaluationContext`), the planner (`resolvePlan`, `classifyTask`, `STATIC_PLANS`), the effects runtime (`Effect`, `EffectHandler`, built-in handlers, `parseOracleResponse`), and the typed memory primitives (`MemorySchema`, `applyMemoryWrite`, `defaultMemoryInjector`).
+- `RLMOptions` is reshaped: `{ budget, taskType, subLm, lmRegistry, handlers, plans, trackTrace }`. No REPL-era fields remain.
+- `GEPA`'s `PredictorTrace.history: REPLHistory | null` is replaced with `executionTrace: readonly EvaluationTrace[] | null`. GEPA is no longer RLM-coupled at the type level.
+
+Why:
+
+The v1 contract embedded a REPL-shaped execution model that conflated synchronous and asynchronous LM usage, required an `eval` / `vm` sandbox, leaked string-parsed control flow into every integration, and allowed unbounded free-form memory. The v0.2.0 contract is: typed AST, deterministic planner, structured effects, typed memory, async-only. The vision is in [docs/RLM_V2_VISION.md](docs/RLM_V2_VISION.md); the architecture decision record is [docs/product/rlm-v2-architecture.md](docs/product/rlm-v2-architecture.md); the implementation plan is in [docs/RLM_V2_IMPLEMENTATION_PLAN.md](docs/RLM_V2_IMPLEMENTATION_PLAN.md).
+
+Migration sketch:
+
+```ts
+// v0.1.x
+const rlm = new RLM(sig);
+const pred = rlm.forward({ context: ctx, question: q });
+
+// v0.2.x
+const rlm = new RLM(sig);
+const pred = await rlm.aforward({ context: ctx, question: q });
+```
+
+No migration shim is provided; the v1 surface is deleted, not deprecated.
+
 ## What this repo optimizes for
 
 - Small, readable abstractions

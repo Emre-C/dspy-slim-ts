@@ -21,6 +21,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "deps:circular": "madge --circular --extensions ts --ts-config tsconfig.typecheck.json src",
+    "deps:rlm-legacy": "node tools/deps_rlm_legacy.mjs",
     "knip": "knip",
     "pack:dry-run": "pnpm pack --dry-run",
     "release:gate": "uv run ../benchmarks/release_gate.py",
