@@ -181,12 +181,37 @@ function flattenCitations(value: unknown): readonly unknown[] | undefined {
   return flattened.length === 0 ? undefined : Object.freeze(flattened.map((item) => snapshotOwnedValue(item)));
 }
 
+/** OpenAI-compatible APIs sometimes return `content` as a string or as a list of `{ type, text }` parts. */
+function stringifyAssistantContent(content: unknown): string {
+  if (content === null || content === undefined) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    let acc = '';
+    for (const part of content) {
+      if (typeof part === 'string') {
+        acc += part;
+      } else if (isPlainObject(part) && typeof part.text === 'string') {
+        acc += part.text;
+      }
+    }
+    return acc;
+  }
+  return '';
+}
+
 function processChatCompletion(
   response: ChatCompletionResponse,
   mergedKwargs: Record<string, unknown>,
 ): readonly LMOutput[] {
   const outputs = response.choices.map((choice) => {
-    const text = choice.message?.content ?? choice.message?.refusal ?? choice.text ?? '';
+    const text =
+      stringifyAssistantContent(choice.message?.content as unknown)
+      || (typeof choice.message?.refusal === 'string' ? choice.message.refusal : '')
+      || (typeof choice.text === 'string' ? choice.text : '');
     const citations = flattenCitations(choice.message?.provider_specific_fields?.citations);
     const envelope: LMOutputEnvelope = {
       text,

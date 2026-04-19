@@ -29,6 +29,8 @@
     "release:gate": "uv run ../benchmarks/release_gate.py",
     "bench:minimax-policy": "npx tsx tests/minimax_policy_benchmark.ts",
     "bench:longcot": "npx tsx tools/bench_longcot_rlm.ts",
+    "bench:longcot:preflight": "npx tsx tools/bench_longcot_rlm.ts --preflight",
+    "bench:longcot:smoke": "npx tsx tools/bench_longcot_rlm.ts --smoke",
     "bench:rlm-v2": "npx tsx tools/record_rlm_v2.ts --verify",
     "record:rlm-v2": "npx tsx tools/record_rlm_v2.ts",
     "smoke:consumer": "bash tools/consumer_smoke.sh"

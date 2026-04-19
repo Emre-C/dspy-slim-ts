@@ -5,18 +5,26 @@
  *   cd tools/longcot && uv sync
  *
  * Usage:
- *   HF_TOKEN=... pnpm run bench:longcot -- --domain logic --difficulty easy --max 2
+ *   pnpm run bench:longcot -- --domain logic --difficulty easy --max 2
+ *
+ *   If `HF_TOKEN` is unset, the runner loads repo-root `.env` (same directory as
+ *   `package.json`). Explicit environment variables always win.
  *
  *   # Export + score only (no API calls; responses are empty — expect 0 accuracy)
  *   pnpm run bench:longcot -- --dry-run --max 1
+ *
+ * Cost safety (use in order):
+ *   1. --preflight     One tiny HF chat completion (~tens of tokens); no LongCoT / RLM.
+ *   2. --smoke         One LongCoT question with hard caps (summarise, ≤32 oracle calls, ≤2k completion tokens).
+ *   3. Larger runs      Require --i-accept-cost when --max > 20, completion tokens > 50k, or oracle cap > 500.
  */
 
 import { spawnSync } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
-import { mkdirSync } from 'node:fs';
+import { createWriteStream, mkdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import type { LMOutput } from '../src/lm.js';
 import {
   LM,
   RLM,
@@ -27,6 +35,45 @@ import {
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
 const LONGCOT_DIR = resolve(REPO_ROOT, 'tools', 'longcot');
+
+/**
+ * Minimal `.env` loader (no dependency on `dotenv`). Does not override existing
+ * `process.env` entries.
+ */
+function loadRootEnvFile(): void {
+  const path = resolve(REPO_ROOT, '.env');
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch {
+    return;
+  }
+
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('#')) {
+      continue;
+    }
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      continue;
+    }
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
 
 interface LongCoTQuestion {
   readonly question_id: string;
@@ -49,12 +96,95 @@ interface CliOptions {
   readonly maxCompletionTokens: number;
   readonly outDir: string;
   readonly maxOracleCalls: number;
+  /** Extra-aggressive caps for a single cheap end-to-end probe */
+  readonly smoke: boolean;
+}
+
+const SMOKE_MAX_COMPLETION_TOKENS = 2048;
+const SMOKE_MAX_ORACLE_CALLS = 32;
+
+function lmOutputText(out: LMOutput | undefined): string {
+  if (out === undefined) {
+    return '';
+  }
+  return typeof out === 'string' ? out : out.text;
+}
+
+function applySmokeCaps(opts: CliOptions): CliOptions {
+  return {
+    ...opts,
+    max: 1,
+    taskType: 'summarise',
+    maxCompletionTokens: Math.min(opts.maxCompletionTokens, SMOKE_MAX_COMPLETION_TOKENS),
+    maxOracleCalls: Math.min(opts.maxOracleCalls, SMOKE_MAX_ORACLE_CALLS),
+    noFallbackScore: true,
+    smoke: true,
+  };
+}
+
+function isExpensiveRun(opts: CliOptions): boolean {
+  return (
+    opts.max > 20 ||
+    opts.maxCompletionTokens > 50_000 ||
+    opts.maxOracleCalls > 500
+  );
+}
+
+async function runPreflight(model: string, apiBase: string): Promise<void> {
+  const hfToken = process.env.HF_TOKEN;
+  if (!hfToken) {
+    console.error(
+      'Missing HF_TOKEN. Add it to .env in the repo root, export it, or pass --dry-run on the full bench.',
+    );
+    process.exit(1);
+  }
+
+  const lm = new LM({
+    model,
+    apiKey: hfToken,
+    apiBase,
+    kwargs: {
+      // Reasoning models (e.g. MiniMax on HF) may spend the first chunk of the
+      // budget in `reasoning_content`; keep this high enough for a visible answer.
+      max_completion_tokens: 512,
+    },
+  });
+
+  const t0 = Date.now();
+  const outputs = await lm.acall(
+    'Reply with exactly the single capital letter A and nothing else.',
+    undefined,
+    {},
+  );
+  const dt = Date.now() - t0;
+  let text = lmOutputText(outputs[0]).trim();
+
+  if (text.length === 0 && lm.history.length > 0) {
+    const snap = lm.history[lm.history.length - 1]!;
+    const raw = snap.response;
+    console.error(
+      'preflight: empty parsed text; last response (truncated, for debugging):',
+      JSON.stringify(raw).slice(0, 1200),
+    );
+  }
+
+  if (text.length === 0) {
+    console.error(
+      'preflight failed: empty completion. Check HF model id, HF_TOKEN, and that the router returns message.content as a string.',
+    );
+    process.exit(1);
+  }
+
+  console.error(
+    `preflight OK in ${String(dt)}ms (completion length ${String(text.length)}, first 80 chars quoted below)`,
+  );
+  console.error(JSON.stringify(text.slice(0, 80)));
 }
 
 function parseArgs(argv: string[]): CliOptions {
   let domain = 'logic';
   let difficulty = 'easy';
-  let max = 3;
+  let max = 1;
   let taskType: TaskType = 'multi_hop';
   let dryRun = false;
   let noFallbackScore = false;
@@ -63,6 +193,7 @@ function parseArgs(argv: string[]): CliOptions {
   let maxCompletionTokens = Number(process.env.LONGCOT_MAX_COMPLETION_TOKENS ?? 16384);
   let outDir = resolve(REPO_ROOT, 'tools', 'longcot', 'runs');
   let maxOracleCalls = Number(process.env.LONGCOT_RLM_MAX_ORACLE_CALLS ?? 400);
+  let smoke = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!;
@@ -82,6 +213,8 @@ function parseArgs(argv: string[]): CliOptions {
       taskType = t;
     } else if (a === '--dry-run') {
       dryRun = true;
+    } else if (a === '--smoke') {
+      smoke = true;
     } else if (a === '--no-fallback-score') {
       noFallbackScore = true;
     } else if (a === '--model' && argv[i + 1]) {
@@ -104,10 +237,16 @@ Environment:
   LONGCOT_MAX_COMPLETION_TOKENS  Default: 16384
   LONGCOT_RLM_MAX_ORACLE_CALLS   Default: 400
 
+Cost safety:
+  --preflight           One tiny HF completion only (no LongCoT / RLM). Run this first.
+  --smoke               One question, summarise plan, ≤${String(SMOKE_MAX_ORACLE_CALLS)} oracle calls,
+                        ≤${String(SMOKE_MAX_COMPLETION_TOKENS)} completion tokens, --no-fallback-score.
+  --i-accept-cost       Required when --max > 20, completion tokens > 50k, or oracle cap > 500.
+
 Flags:
   --domain logic|cs|chemistry|chess|math
   --difficulty easy|medium|hard
-  --max N
+  --max N               Default: 1 (accidental full-benchmark protection)
   --task-type search|classify|aggregate|pairwise|summarise|multi_hop|unknown
   --dry-run
   --no-fallback-score   Pass through to Python verify (no Gemini fallback)
@@ -135,6 +274,7 @@ Flags:
     maxCompletionTokens,
     outDir,
     maxOracleCalls,
+    smoke,
   };
 }
 
@@ -180,12 +320,47 @@ function exportQuestions(opts: Pick<CliOptions, 'domain' | 'difficulty' | 'max'>
 }
 
 async function main(): Promise<void> {
+  loadRootEnvFile();
+
   const raw = process.argv.slice(2).filter((a) => a !== '--');
-  const opts = parseArgs(raw);
+  const wantsPreflight = raw.includes('--preflight');
+  const acceptsCost = raw.includes('--i-accept-cost');
+  const argvForParse = raw.filter((a) => a !== '--preflight' && a !== '--i-accept-cost');
+
+  let opts = parseArgs(argvForParse);
+  if (opts.smoke) {
+    opts = applySmokeCaps(opts);
+    console.error(
+      '[bench:longcot] --smoke: forcing max=1, task-type=summarise, ' +
+        `max-oracle-calls<=${String(SMOKE_MAX_ORACLE_CALLS)}, ` +
+        `max-completion-tokens<=${String(SMOKE_MAX_COMPLETION_TOKENS)}, --no-fallback-score`,
+    );
+  }
+
+  if (wantsPreflight) {
+    if (!process.env.HF_TOKEN) {
+      console.error(
+        'Missing HF_TOKEN. Add it to .env in the repo root or export it before --preflight.',
+      );
+      process.exit(1);
+    }
+    await runPreflight(opts.model, opts.apiBase);
+    return;
+  }
 
   if (!opts.dryRun && !process.env.HF_TOKEN) {
-    console.error('Missing HF_TOKEN. Set it for Hugging Face router access, or pass --dry-run.');
+    console.error(
+      'Missing HF_TOKEN. Add it to .env in the repo root, export it, or pass --dry-run.',
+    );
     process.exit(1);
+  }
+
+  if (!opts.dryRun && isExpensiveRun(opts) && !acceptsCost) {
+    console.error(
+      '[bench:longcot] Refusing a potentially expensive run (large --max and/or high limits).\n' +
+        '  Use --smoke or lower --max / limits first. To proceed anyway, add --i-accept-cost.',
+    );
+    process.exit(2);
   }
 
   mkdirSync(opts.outDir, { recursive: true });
@@ -204,10 +379,14 @@ async function main(): Promise<void> {
   console.error(`Exported ${String(questions.length)} question(s) → ${responsesPath}`);
 
   if (!opts.dryRun) {
+    const hfToken = process.env.HF_TOKEN;
+    if (!hfToken) {
+      throw new Error('HF_TOKEN disappeared after loadRootEnvFile (internal error)');
+    }
     settings.configure({
       lm: new LM({
         model: opts.model,
-        apiKey: process.env.HF_TOKEN,
+        apiKey: hfToken,
         apiBase: opts.apiBase,
         kwargs: {
           max_completion_tokens: opts.maxCompletionTokens,

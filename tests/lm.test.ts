@@ -158,6 +158,29 @@ describe('LM', () => {
     expect(await lm.acall(undefined, [{ role: 'user', content: 'second' }])).toEqual(['']);
   });
 
+  it('concatenates chat completion content delivered as text parts (OpenAI-compatible)', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'gpt-4.1-mini',
+        choices: [
+          {
+            message: {
+              content: [
+                { type: 'text', text: 'hel' },
+                { type: 'text', text: 'lo' },
+              ],
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+      },
+    });
+
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', fetch: fetchMock });
+    expect(await lm.acall(undefined, [{ role: 'user', content: 'hi' }])).toEqual(['hello']);
+  });
+
   it('records reasoning token usage from nested completion token details', async () => {
     const fetchMock = mockFetch({
       body: {
