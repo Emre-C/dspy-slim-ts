@@ -20,6 +20,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "deps:circular": "madge --circular --extensions ts --ts-config tsconfig.typecheck.json src",
+    "knip": "knip",
     "pack:dry-run": "pnpm pack --dry-run",
     "release:gate": "uv run ../benchmarks/release_gate.py",
     "bench:minimax-policy": "npx tsx tests/minimax_policy_benchmark.ts"
@@ -27,6 +29,8 @@
   "devDependencies": {
     "@ax-llm/ax": "^19.0.41",
     "@types/node": "^25.5.2",
+    "knip": "^6.4.1",
+    "madge": "^8.0.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   },

@@ -1,12 +1,4 @@
-/**
- * §4.3 — ChainOfThought: a thin Predict wrapper that prepends reasoning.
- *
- * The generics mirror `Predict`'s: `TSig` accepts a signature literal string
- * or a runtime `Signature` object, and `TInputs`/`TOutputs` are derived so
- * that a literal-string construction gets autocompletion on both sides.
- * `TOutputs` is intersected with `{ reasoning: string }` because CoT always
- * prepends a reasoning output field at runtime.
- */
+/** §4.3 — Predict wrapper that prepends a `reasoning` output field; `TOutputs` includes `reasoning: string`. */
 
 import { createField } from './field.js';
 import { Module } from './module.js';
@@ -17,6 +9,10 @@ import type { Flatten, InferInputs, InferOutputs, SignatureInput } from './signa
 
 const EMPTY_RECORD = Object.freeze({}) as Record<string, unknown>;
 
+/**
+ * Inner `Predict` is built from the widened `Signature` (after `prependField`);
+ * class generics still anchor inference to the caller’s `TSig`.
+ */
 export class ChainOfThought<
   TSig extends SignatureInput = Signature,
   TInputs extends Record<string, unknown> = InferInputs<TSig>,
@@ -38,10 +34,6 @@ export class ChainOfThought<
       }),
     );
 
-    // The extended signature is a runtime `Signature`, not a literal string,
-    // so we explicitly specialize the inner `Predict` with `Signature` as
-    // `TSig`. `TInputs` and `TOutputs` still flow through from the caller's
-    // literal-string inference.
     this.predict = new Predict<Signature, TInputs, TOutputs>(extendedSignature, config);
   }
 

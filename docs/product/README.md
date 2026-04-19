@@ -58,3 +58,4 @@ those, and the document itself should be stable enough not to need them.
 - [Sync LM Removal](./sync-lm-removal.md)
 - [Provider Profile Boundary](./provider-profile-boundary.md)
 - [Type-Level Signature Inference](./type-level-signature-inference.md)
+- [Release Gate Pack Tooling](./release-gate-pack-tooling.md) — why `pack:dry-run` uses pnpm while the automated gate uses `npm pack --json`

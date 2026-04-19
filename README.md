@@ -1,14 +1,8 @@
 # dspy-slim-ts
 
-A craftsmanship-first TypeScript port of `dspy-slim`.
+An opinionated TypeScript port of `dspy-slim`, which itself is a slimmed down version of the upstream infamous DSPy framework.
 
-All four spec tiers are implemented and enforced in CI. The formal
-specification in `../spec/abstractions.md` is the source of truth.
-The product decision records under `docs/product/` explain why the
-implementation is shaped the way it is. The test suite in `tests/` is
-fixture-driven and documents the runtime contract in executable form.
-
-## What This Repo Optimizes For
+## What this repo optimizes for
 
 - Small, readable abstractions
 - Strict type safety over convenient looseness
@@ -16,16 +10,16 @@ fixture-driven and documents the runtime contract in executable form.
 - Stable names for public concepts and internal boundaries
 - Spec fidelity over compatibility theater
 
-## Spec Tier Status
+## Spec tiers
 
-| Tier | Scope | Status |
-|------|-------|--------|
-| 1 — Minimal viable port | Signature, Field, Example, Prediction, Module, Predict, ChainOfThought, Adapters, LM, Settings | ✅ Complete |
-| 2 — Agent workflows | Tool, ToolCalls, ReAct, History, native function calling | ✅ Complete |
-| 3 — Optimization | Parallel executor, Callback system, GEPA wrapper, Evaluate | ✅ Complete |
-| 4 — Full parity | RLM scaffold, NodeCodeInterpreter, budget vectors | ✅ Complete |
+Each tier is complete. Scope by tier:
 
-## Primary Source Files
+- **Tier 1 — Minimal viable port:** Signature, Field, Example, Prediction, Module, Predict, ChainOfThought, Adapters, LM, Settings
+- **Tier 2 — Agent workflows:** Tool, ToolCalls, ReAct, History, native function calling
+- **Tier 3 — Optimization:** Parallel executor, Callback system, GEPA wrapper, Evaluate
+- **Tier 4 — Full parity:** RLM scaffold, NodeCodeInterpreter, budget vectors
+
+## Primary source files
 
 - `src/field.ts` — immutable field construction and validation
 - `src/signature.ts` — signature value objects, parsing, and ops
@@ -45,7 +39,7 @@ fixture-driven and documents the runtime contract in executable form.
 - `src/rlm.ts` — recursive language model scaffold
 - `src/gepa.ts` — GEPA optimization wrapper
 
-## Reading Order
+## Reading order
 
 1. `../spec/abstractions.md`
 2. `docs/product/README.md`
@@ -54,28 +48,28 @@ fixture-driven and documents the runtime contract in executable form.
 
 ## Development
 
+This package uses pnpm (`pnpm-lock.yaml`).
+
 ```sh
-npm run build      # compile TypeScript
-npm test           # run all tests (vitest)
-npm run typecheck  # type-check without emitting
-npm run release:gate  # verify release artifacts + npm publish surface
+pnpm run build         # compile TypeScript
+pnpm test              # run all tests (vitest)
+pnpm run typecheck     # type-check without emitting
+pnpm run pack:dry-run  # tarball file list (pnpm)
+pnpm run release:gate  # full gate via ../benchmarks/release_gate.py
 ```
 
 Keep changes small, explicit, and grounded in the spec.
 
-## Release Gate
+## Release gate
 
-Public release readiness is machine-checked in CI by combining:
+CI combines these steps:
 
-- `npm run build`
-- `npm run typecheck`
-- `npm test`
+- `pnpm run build`
+- `pnpm run typecheck`
+- `pnpm test`
 - `./benchmarks/run_benchmarks.sh --all`
-- `uv run benchmarks/release_gate.py`
+- `pnpm run release:gate` (runs `uv run ../benchmarks/release_gate.py`)
 
-The release gate enforces:
+The gate checks replay fixtures (`react_replay`, `react_recorded`, `rlm_replay`), a golden corpus with minimum dataset sizes (`gsm8k=50`, `squad=25`, `hotpotqa=25`, 100+ examples total), Node 20/22/24 in CI, and a curated publish tarball (`dist` plus package metadata and docs).
 
-- replay fixture presence and validity (`react_replay`, `react_recorded`, `rlm_replay`)
-- a 3-dataset golden corpus with minimum counts (`gsm8k=50`, `squad=25`, `hotpotqa=25`) and `100+` total examples
-- Node runtime matrix coverage (20/22/24) in CI
-- a curated npm tarball surface (dist artifacts + package metadata/docs only)
+The automated pack step uses `npm pack --dry-run --json` while local inspection uses pnpm; the JSON shapes differ, so the split is intentional. Details: [docs/product/release-gate-pack-tooling.md](docs/product/release-gate-pack-tooling.md).

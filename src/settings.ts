@@ -6,9 +6,9 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { Callback } from './callback.js';
+import type { CallerModuleLike } from './caller_module_types.js';
+import type { Callback } from './callback_types.js';
 import { RuntimeError } from './exceptions.js';
-import type { Module } from './module.js';
 import type { AdapterLike, LMLike } from './types.js';
 
 function freezeList<T>(items: readonly T[] | undefined): readonly T[] {
@@ -23,7 +23,7 @@ export interface SettingsSnapshot {
   readonly disableHistory: boolean;
   readonly maxHistorySize: number;
   readonly callbacks: readonly Callback[];
-  readonly callerModules: readonly Module[];
+  readonly callerModules: readonly CallerModuleLike[];
 }
 
 export interface SettingsOverrides {
@@ -34,7 +34,7 @@ export interface SettingsOverrides {
   readonly disableHistory?: boolean;
   readonly maxHistorySize?: number;
   readonly callbacks?: readonly Callback[];
-  readonly callerModules?: readonly Module[];
+  readonly callerModules?: readonly CallerModuleLike[];
 }
 
 interface SettingsContextState {
@@ -50,7 +50,7 @@ const DEFAULT_SETTINGS: SettingsSnapshot = Object.freeze({
   disableHistory: false,
   maxHistorySize: 10000,
   callbacks: freezeList<Callback>(undefined),
-  callerModules: freezeList<Module>(undefined),
+  callerModules: freezeList<CallerModuleLike>(undefined),
 });
 
 function mergeSettings(
@@ -150,7 +150,7 @@ export class Settings {
     return this.snapshot().callbacks;
   }
 
-  get callerModules(): readonly Module[] {
+  get callerModules(): readonly CallerModuleLike[] {
     return this.snapshot().callerModules;
   }
 

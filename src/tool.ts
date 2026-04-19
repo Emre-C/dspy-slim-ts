@@ -103,22 +103,23 @@ function inferParameters(func: ToolFunction): readonly ParameterSpec[] {
     return Object.freeze([]);
   }
 
-  return Object.freeze(splitTopLevel(parameterList).flatMap((segment) => {
+  const specs: ParameterSpec[] = [];
+  for (const segment of splitTopLevel(parameterList)) {
     const raw = segment.trim();
     if (raw === '') {
-      return [];
+      continue;
     }
 
     const withoutRest = raw.replace(/^\.\.\./, '').trim();
     const name = withoutRest.split('=')[0]!.trim();
     if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
-      throw new ValueError(
-        'Tool parameters must be simple identifiers unless explicit args metadata is provided.',
-      );
+      return Object.freeze([]);
     }
 
-    return [{ name }];
-  }));
+    specs.push({ name });
+  }
+
+  return Object.freeze(specs);
 }
 
 function normalizeArgNames(
@@ -237,12 +238,7 @@ export class Tool<TFunc extends ToolFunction = ToolFunction> {
     this.func = func;
     this.#runtimeFunc = func;
 
-    let inferredParameters: readonly ParameterSpec[] = Object.freeze([]);
-    try {
-      inferredParameters = inferParameters(func);
-    } catch {
-      inferredParameters = Object.freeze([]);
-    }
+    const inferredParameters = inferParameters(func);
 
     const argNames = normalizeArgNames(inferredParameters, options.args, options.argTypes);
     const explicitArgMetadataCount = Object.keys(options.args ?? {}).length + Object.keys(options.argTypes ?? {}).length;
@@ -355,6 +351,12 @@ export class Tool<TFunc extends ToolFunction = ToolFunction> {
     return invokeToolFunction(this.#runtimeFunc, positionalArgs);
   }
 }
+
+/**
+ * Value accepted where a {@link Tool} is configured: an instance or a bare
+ * function that callers (e.g. ReAct, RLM) wrap into a {@link Tool}.
+ */
+export type ToolInput = Tool | ((...args: readonly unknown[]) => unknown);
 
 function normalizeToolCall(value: unknown): ToolCall {
   if (!isPlainObject(value)) {

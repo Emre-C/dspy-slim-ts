@@ -3,5 +3,9 @@ dist/
 *.tsbuildinfo
 .env
 
+# Cursor — local MCP and debug noise (keep on disk; do not commit)
+.cursor/mcp.json
+.cursor/debug.log
+
 # Local agent instructions (contains internal design rationale not for public consumption)
 AGENTS.md

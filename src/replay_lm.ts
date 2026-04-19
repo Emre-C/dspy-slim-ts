@@ -9,7 +9,7 @@
  */
 
 import { readFileSync } from 'node:fs';
-import type { Message } from './adapter.js';
+import type { Message } from './chat_message.js';
 import { BaseLM, type LMOutput } from './lm.js';
 import { RuntimeError } from './exceptions.js';
 import { ownedValueEquals, snapshotOwnedValue } from './owned_value.js';

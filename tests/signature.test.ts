@@ -16,10 +16,6 @@ import {
 import { createField, Field } from '../src/field.js';
 import type { FieldKind, TypeTag } from '../src/types.js';
 
-// ---------------------------------------------------------------------------
-// Fixture types
-// ---------------------------------------------------------------------------
-
 interface ParseFixtureField {
   name: string;
   type_tag: string;
@@ -59,10 +55,6 @@ interface OpsCase {
   expected?: string;
   expected_intersection?: string[];
 }
-
-// ---------------------------------------------------------------------------
-// Load fixtures
-// ---------------------------------------------------------------------------
 
 const parseFixture: { cases: ParseCase[] } = JSON.parse(
   readFileSync(

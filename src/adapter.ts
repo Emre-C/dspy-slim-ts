@@ -3,6 +3,7 @@
  */
 
 import { coerceBoolean, coerceJsonContainer, coerceNumber } from './codec.js';
+import type { Message } from './chat_message.js';
 import type { Callback } from './callback.js';
 import { runWithCallbacks } from './callback.js';
 import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
@@ -19,23 +20,9 @@ import {
 import { resolveProfile } from './providers/index.js';
 import { deleteField, Signature, signatureString } from './signature.js';
 import { Tool, ToolCalls } from './tool.js';
-import type { Role, TypeTag } from './types.js';
+import type { TypeTag } from './types.js';
 
-export interface ContentPart {
-  readonly type: 'text' | 'image_url' | 'file';
-  readonly text?: string;
-  readonly image_url?: { readonly url: string };
-  readonly file?: {
-    readonly file_data?: string;
-    readonly filename?: string;
-    readonly file_id?: string;
-  };
-}
-
-export interface Message {
-  readonly role: Role;
-  readonly content: string | readonly ContentPart[];
-}
+export type { ContentPart, Message } from './chat_message.js';
 
 export type Demo = Example | Record<string, unknown>;
 

@@ -9,7 +9,6 @@
 import { openRouterMinimaxProfile } from './openrouter_minimax.js';
 import { registerProfile } from './profile.js';
 
-export type { ProviderProfile } from './profile.js';
 export { registerProfile, resolveProfile } from './profile.js';
 
 registerProfile(openRouterMinimaxProfile);

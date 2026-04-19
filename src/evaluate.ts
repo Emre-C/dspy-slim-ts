@@ -11,6 +11,7 @@ import type { Callback } from './callback.js';
 import { runWithCallbacks, runWithCallbacksAsync } from './callback.js';
 import { Example } from './example.js';
 import { ValueError } from './exceptions.js';
+import type { Module } from './module.js';
 import { snapshotRecord } from './owned_value.js';
 import { Parallel } from './parallel.js';
 import { Prediction } from './prediction.js';
@@ -29,19 +30,27 @@ export type EvaluationMetric<TScore = unknown> = (
 /**
  * Minimal duck-typed contract for a program that can be evaluated.
  *
- * The `call` / `acall` parameter type is declared as `any` so that typed
- * subclasses like `Predict<'q -> a'>` (whose `.call` expects the narrower
- * `{ q: string }`) remain assignable to this contract. Using `any` here is
- * a deliberate, scoped escape from strict function-parameter variance: the
- * runtime always passes a `Record<string, unknown>` derived from an
- * example's declared inputs, and narrowing this contract to that record
- * shape would reject every load-bearing typed predictor the library exposes.
+ * `TInputs` matches each module’s kwargs (e.g. `{ question: string }` for a
+ * typed `Predict`). Evaluation maps examples with {@link evalKwargs}; the
+ * devset must align with the program’s input signature.
  */
-export interface EvaluateProgram {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  call(kwargs: any): Prediction;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  acall?(kwargs: any): Promise<Prediction>;
+export interface EvaluateProgram<TInputs extends Record<string, unknown> = Record<string, unknown>> {
+  call(kwargs: TInputs, ...args: readonly unknown[]): Prediction;
+  acall?(kwargs: TInputs, ...args: readonly unknown[]): Promise<Prediction>;
+}
+
+/** `Module` (e.g. `Predict`) or a duck-typed program object. */
+export type EvaluableProgram<TInputs extends Record<string, unknown>> =
+  | Module<TInputs>
+  | EvaluateProgram<TInputs>;
+
+/**
+ * Bridges serialized example inputs to a program’s typed kwargs. This is the
+ * single assertion point: runtime correctness depends on the devset matching
+ * the program, same as the previous `any`-based contract.
+ */
+function evalKwargs<TInputs extends Record<string, unknown>>(example: Example): TInputs {
+  return example.inputs().toDict() as TInputs;
 }
 
 export interface EvaluateOptions<TScore = unknown> {
@@ -53,7 +62,6 @@ export interface EvaluateOptions<TScore = unknown> {
   readonly provideTraceback?: boolean | null;
   readonly failureScore?: number;
   readonly callbackMetadata?: Record<string, unknown> | null;
-  readonly returnOutputs?: boolean;
   readonly callbacks?: readonly Callback[];
 }
 
@@ -116,9 +124,10 @@ function numericScoreOf(score: unknown): number {
   throw new ValueError('Evaluation metrics must return a finite number or a score-bearing Prediction/object.');
 }
 
-function hasAsyncProgram(program: EvaluateProgram): program is EvaluateProgram & {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  acall(kwargs: any): Promise<Prediction>;
+function hasAsyncProgram<TInputs extends Record<string, unknown>>(
+  program: EvaluableProgram<TInputs>,
+): program is EvaluableProgram<TInputs> & {
+  acall(kwargs: TInputs, ...args: readonly unknown[]): Promise<Prediction>;
 } {
   return typeof program.acall === 'function';
 }
@@ -157,12 +166,6 @@ export class Evaluate<TScore = unknown> {
   readonly callbacks: readonly Callback[];
 
   constructor(options: EvaluateOptions<TScore>) {
-    if (options.returnOutputs !== undefined) {
-      throw new ValueError(
-        '`returnOutputs` is no longer supported. Results are always returned inside `EvaluationResult.results`.',
-      );
-    }
-
     this.devset = options.devset;
     this.metric = options.metric ?? null;
     this.numThreads = options.numThreads ?? null;
@@ -174,18 +177,24 @@ export class Evaluate<TScore = unknown> {
     this.callbacks = Object.freeze([...(options.callbacks ?? [])]);
   }
 
-  forward(program: EvaluateProgram, options: EvaluateCallOptions<TScore> = {}): EvaluationResult<TScore> {
+  forward<TInputs extends Record<string, unknown>>(
+    program: EvaluableProgram<TInputs>,
+    options: EvaluateCallOptions<TScore> = {},
+  ): EvaluationResult<TScore> {
     return this.call(program, options);
   }
 
-  aforward(
-    program: EvaluateProgram,
+  aforward<TInputs extends Record<string, unknown>>(
+    program: EvaluableProgram<TInputs>,
     options: EvaluateCallOptions<TScore> = {},
   ): Promise<EvaluationResult<TScore>> {
     return this.acall(program, options);
   }
 
-  call(program: EvaluateProgram, options: EvaluateCallOptions<TScore> = {}): EvaluationResult<TScore> {
+  call<TInputs extends Record<string, unknown>>(
+    program: EvaluableProgram<TInputs>,
+    options: EvaluateCallOptions<TScore> = {},
+  ): EvaluationResult<TScore> {
     const metric = ensureMetric(options.metric ?? this.metric);
     const devset = ensureDevset(options.devset ?? this.devset);
     const numThreads = options.numThreads ?? this.numThreads;
@@ -206,7 +215,7 @@ export class Evaluate<TScore = unknown> {
       execute: () => {
         const executor = this.createExecutor(numThreads, displayProgress);
         const outputs = executor.execute((example) => {
-          const prediction = ensurePrediction(program.call(example.inputs().toDict()));
+          const prediction = ensurePrediction(program.call(evalKwargs<TInputs>(example)));
           const score = metric(example, prediction);
           if (score instanceof Promise) {
             throw new ValueError('Evaluate.call received an async metric; use acall instead.');
@@ -218,8 +227,8 @@ export class Evaluate<TScore = unknown> {
     });
   }
 
-  async acall(
-    program: EvaluateProgram,
+  async acall<TInputs extends Record<string, unknown>>(
+    program: EvaluableProgram<TInputs>,
     options: EvaluateCallOptions<TScore> = {},
   ): Promise<EvaluationResult<TScore>> {
     const metric = ensureMetric(options.metric ?? this.metric);
@@ -244,8 +253,8 @@ export class Evaluate<TScore = unknown> {
         const outputs = await executor.executeAsync(async (example) => {
           const prediction = ensurePrediction(
             hasAsyncProgram(program)
-              ? await program.acall(example.inputs().toDict())
-              : program.call(example.inputs().toDict()),
+              ? await program.acall(evalKwargs<TInputs>(example))
+              : program.call(evalKwargs<TInputs>(example)),
           );
           const score = await Promise.resolve(metric(example, prediction));
           return [prediction, score] as const;

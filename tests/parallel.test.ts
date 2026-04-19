@@ -259,12 +259,10 @@ describe('Parallel', () => {
   it('encapsulates mutable run state from external access', () => {
     const parallel = new Parallel({ numThreads: 1 });
 
-    // Getters expose failure state as readonly
     expect(parallel.failedIndices).toEqual([]);
     expect(parallel.failedItems).toEqual([]);
     expect(parallel.exceptions).toEqual([]);
 
-    // Internal state is not publicly writable
     expect('errorCount' in parallel).toBe(false);
     expect('cancelJobs' in parallel).toBe(false);
   });
@@ -289,7 +287,6 @@ describe('Parallel', () => {
     ]) as readonly (string | null)[];
 
     expect(results).toEqual(['1', '2', '3']);
-    // Each task ran and observed a settings snapshot
     expect(snapshots).toHaveLength(3);
   });
 });

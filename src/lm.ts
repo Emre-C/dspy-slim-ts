@@ -3,16 +3,21 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { Message } from './adapter.js';
+import type { Message } from './chat_message.js';
 import type { Callback } from './callback.js';
 import { runWithCallbacks, runWithCallbacksAsync } from './callback.js';
 import { ConfigurationError, ContextWindowExceededError, RuntimeError } from './exceptions.js';
+import type { HistoryEntry } from './history_entry.js';
 import { isPlainObject } from './guards.js';
+import type { LMOutput, LMOutputEnvelope, ToolCallWire } from './lm_output.js';
 import { snapshotOwnedValue, snapshotRecord } from './owned_value.js';
 import { resolveProfile } from './providers/index.js';
 import { providerModelName, providerNameFromModel } from './providers/model_id.js';
 import { settings } from './settings.js';
 import type { ModelType } from './types.js';
+
+export type { HistoryEntry } from './history_entry.js';
+export type { LMOutput, LMOutputEnvelope, ToolCallWire } from './lm_output.js';
 
 const GLOBAL_HISTORY_MAX_SIZE = 10_000;
 const REASONING_MODEL_PATTERN = /^(?:o[1345](?:-(?:mini|nano|pro))?(?:-\d{4}-\d{2}-\d{2})?|gpt-5(?!-chat)(?:-.*)?)$/;
@@ -28,25 +33,7 @@ export interface BaseLMOptions {
   readonly kwargs?: Record<string, unknown>;
 }
 
-export interface ToolCallWire {
-  readonly id?: string | undefined;
-  readonly type?: 'function' | undefined;
-  readonly function: {
-    readonly name: string;
-    readonly arguments: string;
-  };
-}
-
-export interface LMOutputEnvelope {
-  readonly text: string;
-  readonly logprobs?: unknown;
-  readonly citations?: readonly unknown[] | undefined;
-  readonly toolCalls?: readonly ToolCallWire[] | undefined;
-}
-
-export type LMOutput = string | LMOutputEnvelope;
-
-export interface ChatCompletionChoice {
+interface ChatCompletionChoice {
   readonly message?: {
     readonly content?: string | null;
     readonly refusal?: string | null;
@@ -66,12 +53,12 @@ export interface ChatCompletionResponse {
   readonly model: string;
 }
 
-export interface ResponsesMessageContentItem {
+interface ResponsesMessageContentItem {
   readonly text?: string;
   readonly annotations?: readonly unknown[];
 }
 
-export interface ResponsesOutputItem {
+interface ResponsesOutputItem {
   readonly type: 'message' | 'function_call' | string;
   readonly content?: readonly ResponsesMessageContentItem[];
   readonly name?: string;
@@ -87,21 +74,6 @@ export interface ResponsesResponse {
 }
 
 export type LMResponse = ChatCompletionResponse | ResponsesResponse;
-
-export interface HistoryEntry {
-  readonly prompt: string | null;
-  readonly messages: readonly Message[] | null;
-  readonly kwargs: Record<string, unknown>;
-  readonly response: unknown;
-  readonly outputs: readonly LMOutput[];
-  readonly usage: Record<string, number>;
-  readonly cost: number | null;
-  readonly timestamp: string;
-  readonly uuid: string;
-  readonly model: string;
-  readonly responseModel: string;
-  readonly modelType: ModelType;
-}
 
 export interface LMOptions extends BaseLMOptions {
   readonly apiKey?: string | undefined;
@@ -848,12 +820,12 @@ export class LM extends BaseLM {
   }
 
   /**
-   * @deprecated `LM` no longer supports synchronous HTTP transport. Use
-   * {@link LM.acall} or {@link LM.aforward} instead. This override is kept
-   * so that existing sync call sites fail with a clear runtime error rather
-   * than a confusing `this.generate is not a function`, and is scheduled for
-   * removal in the next minor release. See
-   * `docs/product/sync-lm-removal.md` for the rationale.
+   * `LM` is async-only (HTTP via {@link LM.aforward}). Sync {@link BaseLM.forward}
+   * is overridden so call sites that still use `forward`/`call` on a real `LM`
+   * get an explicit {@link RuntimeError} instead of the generic
+   * `Subclasses must implement …` failure from {@link BaseLM.generate}.
+   *
+   * See `docs/product/sync-lm-removal.md`.
    */
   override forward(
     _prompt?: string,

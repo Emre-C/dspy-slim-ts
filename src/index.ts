@@ -18,7 +18,7 @@ export { isParameter, markParameter } from './parameter.js';
 
 export { inferPrefix } from './infer_prefix.js';
 
-export type { Callback } from './callback.js';
+export type { Callback, CallbackDispatchKind } from './callback_types.js';
 export { BaseCallback, currentCallID } from './callback.js';
 
 export type { FieldInit } from './field.js';
@@ -57,7 +57,7 @@ export { History, isHistoryLike } from './history.js';
 
 export { Completions, Prediction } from './prediction.js';
 
-export type { JSONSchema, ToolOptions, ToolCall } from './tool.js';
+export type { JSONSchema, ToolInput, ToolOptions, ToolCall } from './tool.js';
 export { Tool, ToolCalls } from './tool.js';
 
 export type {
@@ -125,6 +125,7 @@ export type {
   EvaluationRow,
   EvaluationMetric,
   EvaluateProgram,
+  EvaluableProgram,
   EvaluateOptions,
   EvaluateCallOptions,
 } from './evaluate.js';

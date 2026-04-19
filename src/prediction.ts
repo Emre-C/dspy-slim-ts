@@ -73,10 +73,6 @@ function normalizeCompletionInput(
   return normalized;
 }
 
-// ---------------------------------------------------------------------------
-// Completions
-// ---------------------------------------------------------------------------
-
 export class Completions {
   private readonly _completions: ReadonlyMap<string, readonly unknown[]>;
   readonly signature: Signature | null;
@@ -89,7 +85,6 @@ export class Completions {
       throw new ValueError('Completions.signature must be a Signature or null');
     }
 
-    // Validate: all arrays same length.
     let expectedLen: number | null = null;
     const cloned = cloneCompletionsMap(completions);
     for (const [key, arr] of cloned) {
@@ -133,10 +128,6 @@ export class Completions {
     return this.toDict();
   }
 }
-
-// ---------------------------------------------------------------------------
-// Prediction
-// ---------------------------------------------------------------------------
 
 /**
  * Completion-backed result container with numeric protocol and optional

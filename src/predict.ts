@@ -2,7 +2,7 @@
  * §4 — Predict pipeline.
  */
 
-import { Adapter, ChatAdapter, type Demo, JSONAdapter } from './adapter.js';
+import { Adapter, type Demo, JSONAdapter } from './adapter.js';
 import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
 import { Example } from './example.js';
 import { createField } from './field.js';
@@ -429,5 +429,3 @@ export class Predict<
     }
   }
 }
-
-export { Adapter, ChatAdapter, JSONAdapter };

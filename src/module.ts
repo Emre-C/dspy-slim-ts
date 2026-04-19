@@ -6,7 +6,7 @@
  */
 
 import { isObjectLike, isPlainObject } from './guards.js';
-import type { HistoryEntry } from './lm.js';
+import type { HistoryEntry } from './history_entry.js';
 import type { Prediction } from './prediction.js';
 import { type Parameter, isParameter, markParameter } from './parameter.js';
 import type { Callback } from './callback.js';
@@ -261,5 +261,3 @@ export abstract class Module<
     return settings.lm;
   }
 }
-
-export { PREDICTOR_BRAND };

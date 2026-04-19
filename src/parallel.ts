@@ -10,6 +10,7 @@
  *   Per-task: Pending → Executing → Completed | Failed | Resubmitted
  */
 
+import type { Demo } from './adapter.js';
 import { Example } from './example.js';
 import { RuntimeError, ValueError } from './exceptions.js';
 import { isPlainObject } from './guards.js';
@@ -34,7 +35,7 @@ export interface ParallelCallable<TResult> {
   readonly acall?: ((kwargs: Record<string, unknown>) => Promise<TResult>) | undefined;
 }
 
-export type ParallelInput = Example | Record<string, unknown> | readonly unknown[];
+export type ParallelInput = Demo | readonly unknown[];
 export type ParallelTarget<TResult> = ParallelCallable<TResult> | Parallel | ((...args: readonly unknown[]) => TResult | Promise<TResult>);
 export type ParallelExecPair<TResult, TInput = ParallelInput> = readonly [ParallelTarget<TResult>, TInput];
 export type ParallelResults<TResult> = readonly (TResult | null)[];

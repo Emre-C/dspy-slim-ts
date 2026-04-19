@@ -18,7 +18,7 @@ import {
   type Signature,
 } from './signature.js';
 import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
-import { Tool } from './tool.js';
+import { Tool, type ToolInput } from './tool.js';
 
 const EMPTY_RECORD = Object.freeze({}) as Record<string, unknown>;
 const MAX_TRUNCATION_ATTEMPTS = 3;
@@ -32,8 +32,6 @@ const RESERVED_REACT_INPUT_KEYS = new Set(['trajectory', 'max_iters']);
  */
 export type ReActKwargs<TInputs extends Record<string, unknown>> =
   TInputs & { readonly max_iters?: number };
-
-type ToolInput = Tool | ((...args: unknown[]) => unknown);
 
 interface ReActStep {
   readonly nextThought: string;

@@ -10,14 +10,15 @@
  */
 
 import { ValueError } from '../exceptions.js';
-import type { BaseLM } from '../lm.js';
+import type { LMLike } from '../types.js';
 
 export interface ProviderProfile {
   readonly id: string;
   readonly matches: (model: string) => boolean;
   readonly mapRequest?: (req: Record<string, unknown>) => Record<string, unknown>;
+  /** First argument is the LM instance; `LMLike` is the structural minimum (leaf `types.ts`, no `lm.ts`). */
   readonly adapterRetry?: (
-    lm: BaseLM,
+    lm: LMLike,
     lmKwargs: Record<string, unknown>,
     error: unknown,
   ) => Record<string, unknown> | null;

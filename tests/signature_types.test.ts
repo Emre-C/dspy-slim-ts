@@ -4,19 +4,9 @@ import { Predict, ChainOfThought, Prediction, signatureFromString } from '../src
 import type { ParseSignature } from '../src/signature_types.js';
 
 /**
- * Type-level regression suite for the signature-string parser.
- *
- * These tests serve two purposes:
- *
- * 1. **Static contract.** `expectTypeOf(...).toEqualTypeOf<...>()` encodes the
- *    expected shape of `ParseSignature<...>` and the flow of that shape
- *    through `Predict`, `ChainOfThought`, and `Prediction.getTyped`. They
- *    fail at `tsc` time when the type-level parser drifts, not at runtime.
- *
- * 2. **Runtime / type-level parity.** For every signature we check, we also
- *    parse it with the runtime parser (`signatureFromString`) and assert the
- *    keys agree. The two parsers must stay in lock-step or consumers see one
- *    result in the IDE and another at runtime.
+ * Dual purpose: (1) static contract — `ParseSignature<'...'>` must match what we claim
+ * the parser produces; (2) runtime parity — `signatureFromString` must agree with those
+ * types so tests fail if implementation and type machinery drift apart.
  */
 
 describe('ParseSignature — simple forms', () => {

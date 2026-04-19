@@ -88,7 +88,7 @@ describe('Evaluate', () => {
       displayProgress: false,
     });
 
-    const result = evaluate.call(program);
+    const result = evaluate.call<{ question: string }>(program);
 
     expect(result.score).toBe(100);
     expect(result.results).toHaveLength(2);
@@ -199,13 +199,6 @@ describe('Evaluate', () => {
     };
 
     expect(() => evaluate.call(program)).toThrow('Evaluate requires a metric.');
-  });
-
-  it('throws on deprecated returnOutputs option', () => {
-    expect(() => new Evaluate({
-      devset: [newExample('q', 'a')],
-      returnOutputs: true,
-    })).toThrow('`returnOutputs` is no longer supported');
   });
 
   it('extracts numeric scores from plain objects with a score property', () => {

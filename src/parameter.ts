@@ -27,5 +27,3 @@ export function markParameter<T extends object>(value: T): T & Parameter {
 export function isParameter(value: unknown): value is Parameter {
   return isObjectLike(value) && (value as Partial<Parameter>)[PARAMETER_BRAND] === true;
 }
-
-export { PARAMETER_BRAND };

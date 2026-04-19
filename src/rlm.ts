@@ -14,7 +14,7 @@ import { Predict } from './predict.js';
 import { settings } from './settings.js';
 import { createSignature, ensureSignature, type Signature } from './signature.js';
 import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
-import { Tool } from './tool.js';
+import { Tool, type ToolInput } from './tool.js';
 import type {
   BudgetVector,
   CodeInterpreter,
@@ -38,8 +38,6 @@ const DEFAULT_RESERVED_TOOL_NAMES = Object.freeze([
 ]);
 const IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
-type RLMToolInput = Tool | ((...args: readonly unknown[]) => unknown);
-
 interface NormalizedRLMTool {
   readonly name: string;
   readonly invoke: (...args: readonly unknown[]) => unknown;
@@ -48,7 +46,7 @@ interface NormalizedRLMTool {
 export interface RLMOptions {
   readonly budget?: Partial<BudgetVector>;
   readonly trackTrace?: boolean;
-  readonly tools?: readonly RLMToolInput[];
+  readonly tools?: readonly ToolInput[];
   readonly subLm?: BaseLM | null;
   readonly interpreter?: CodeInterpreter<Record<string, unknown>, unknown>;
   readonly reservedToolNames?: readonly string[];
@@ -156,7 +154,7 @@ function createExtractSignature(signature: ReturnType<typeof ensureSignature>) {
 }
 
 function normalizeTools(
-  tools: readonly RLMToolInput[],
+  tools: readonly ToolInput[],
   reservedNames: ReadonlySet<string>,
 ): ReadonlyMap<string, NormalizedRLMTool> {
   const normalized = new Map<string, NormalizedRLMTool>();
@@ -304,11 +302,6 @@ export class RLM<
     return this.runWithAsyncSession(session, kwargs as Record<string, unknown>);
   }
 
-  // ── Shared loop helpers ──────────────────────────────────────────────
-  // The sync and async run paths differ only in how they call the session
-  // and predictor APIs. All step-processing and finalization logic lives
-  // in these shared methods to keep the two paths in lock-step.
-
   private createEmptyLoopState(): {
     history: REPLHistory;
     fault: CodeInterpreterError | null;
@@ -392,6 +385,12 @@ export class RLM<
       repl_history: formatHistory(history),
     };
   }
+
+  /**
+   * Sync vs async entrypoints share the same conceptual loop (`buildStepInputs`,
+   * `processStepResult`, extract fallback). Keep the two paths aligned so
+   * `forward` and `aforward` differ only in session I/O, not control flow.
+   */
 
   // ── Sync path ───────────────────────────────────────────────────────
 
