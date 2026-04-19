@@ -123,6 +123,7 @@ pnpm test              # run all tests (vitest)
 pnpm run typecheck     # type-check without emitting
 pnpm run pack:dry-run  # tarball file list (pnpm)
 pnpm run release:gate  # full gate via ../benchmarks/release_gate.py
+pnpm run bench:longcot -- --domain logic --difficulty easy --max 2  # LongCoT × RLM (HF_TOKEN); see tools/longcot/README.md
 ```
 
 Keep changes small, explicit, and grounded in the spec.

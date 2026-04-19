@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.venv/
+tools/longcot/runs/
 *.tsbuildinfo
 .env
 

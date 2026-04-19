@@ -1,0 +1,12 @@
+[project]
+name = "dspy-slim-longcot-bridge"
+version = "0.0.0"
+description = "Export LongCoT questions and score RLM responses (used by tools/bench_longcot_rlm.ts)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "longcot @ git+https://github.com/LongHorizonReasoning/longcot.git",
+]
+
+[tool.uv]
+package = false
