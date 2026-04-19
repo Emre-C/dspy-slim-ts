@@ -15,7 +15,7 @@
  *
  * Cost safety (use in order):
  *   1. --preflight     One tiny HF chat completion (~tens of tokens); no LongCoT / RLM.
- *   2. --smoke         One LongCoT question with hard caps (summarise, ≤32 oracle calls, ≤2k completion tokens).
+ *   2. --smoke         One LongCoT question with hard caps (summarise, ≤48 oracle calls, ≤8k completion tokens).
  *   3. Larger runs      Require --i-accept-cost when --max > 20, completion tokens > 50k, or oracle cap > 500.
  */
 
@@ -27,11 +27,14 @@ import { fileURLToPath } from 'node:url';
 import type { LMOutput } from '../src/lm.js';
 import {
   LM,
+  Predict,
   RLM,
   isTaskType,
   settings,
   type TaskType,
 } from '../src/index.js';
+
+type BenchRunner = 'rlm' | 'predict';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
 const LONGCOT_DIR = resolve(REPO_ROOT, 'tools', 'longcot');
@@ -98,10 +101,18 @@ interface CliOptions {
   readonly maxOracleCalls: number;
   /** Extra-aggressive caps for a single cheap end-to-end probe */
   readonly smoke: boolean;
+  /**
+   * `predict` — plain `prompt -> answer` (matches LongCoT free-text `solution = …`).
+   * `rlm` — full RLM v2 (oracle leaves expect structured effect-oracle JSON from the LM).
+   */
+  readonly runner: BenchRunner;
+  /** True when `--runner` was passed; `--smoke` only overrides runner when this is false. */
+  readonly runnerFromCli: boolean;
 }
 
-const SMOKE_MAX_COMPLETION_TOKENS = 2048;
-const SMOKE_MAX_ORACLE_CALLS = 32;
+/** Reasoning-heavy models (e.g. MiniMax on HF) may need room for `reasoning_content` plus answer text per oracle call. */
+const SMOKE_MAX_COMPLETION_TOKENS = 8192;
+const SMOKE_MAX_ORACLE_CALLS = 48;
 
 function lmOutputText(out: LMOutput | undefined): string {
   if (out === undefined) {
@@ -119,6 +130,8 @@ function applySmokeCaps(opts: CliOptions): CliOptions {
     maxOracleCalls: Math.min(opts.maxOracleCalls, SMOKE_MAX_ORACLE_CALLS),
     noFallbackScore: true,
     smoke: true,
+    runner: opts.runnerFromCli ? opts.runner : 'predict',
+    runnerFromCli: opts.runnerFromCli,
   };
 }
 
@@ -194,6 +207,8 @@ function parseArgs(argv: string[]): CliOptions {
   let outDir = resolve(REPO_ROOT, 'tools', 'longcot', 'runs');
   let maxOracleCalls = Number(process.env.LONGCOT_RLM_MAX_ORACLE_CALLS ?? 400);
   let smoke = false;
+  let runner: BenchRunner = 'rlm';
+  let runnerFromCli = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!;
@@ -227,6 +242,13 @@ function parseArgs(argv: string[]): CliOptions {
       outDir = resolve(argv[++i]!);
     } else if (a === '--max-oracle-calls' && argv[i + 1]) {
       maxOracleCalls = Math.max(1, Number(argv[++i]!));
+    } else if (a === '--runner' && argv[i + 1]) {
+      const r = argv[++i]!;
+      if (r !== 'rlm' && r !== 'predict') {
+        throw new Error(`Invalid --runner ${r}. Use "rlm" or "predict".`);
+      }
+      runner = r;
+      runnerFromCli = true;
     } else if (a === '--help' || a === '-h') {
       console.log(`bench_longcot_rlm.ts
 
@@ -239,11 +261,13 @@ Environment:
 
 Cost safety:
   --preflight           One tiny HF completion only (no LongCoT / RLM). Run this first.
-  --smoke               One question, summarise plan, ≤${String(SMOKE_MAX_ORACLE_CALLS)} oracle calls,
-                        ≤${String(SMOKE_MAX_COMPLETION_TOKENS)} completion tokens, --no-fallback-score.
+  --smoke               One question with tight caps + --no-fallback-score. Defaults to --runner predict
+                        (LongCoT wants free-text "solution = …"). Use --smoke --runner rlm only if the LM
+                        reliably emits RLM effect-oracle JSON.
   --i-accept-cost       Required when --max > 20, completion tokens > 50k, or oracle cap > 500.
 
 Flags:
+  --runner rlm|predict  Default: rlm. Use predict for LongCoT (and for --smoke unless overridden).
   --domain logic|cs|chemistry|chess|math
   --difficulty easy|medium|hard
   --max N               Default: 1 (accidental full-benchmark protection)
@@ -275,6 +299,8 @@ Flags:
     outDir,
     maxOracleCalls,
     smoke,
+    runner,
+    runnerFromCli,
   };
 }
 
@@ -333,7 +359,9 @@ async function main(): Promise<void> {
     console.error(
       '[bench:longcot] --smoke: forcing max=1, task-type=summarise, ' +
         `max-oracle-calls<=${String(SMOKE_MAX_ORACLE_CALLS)}, ` +
-        `max-completion-tokens<=${String(SMOKE_MAX_COMPLETION_TOKENS)}, --no-fallback-score`,
+        `max-completion-tokens<=${String(SMOKE_MAX_COMPLETION_TOKENS)}, --no-fallback-score, ` +
+        `runner=${opts.runner}` +
+        (opts.runnerFromCli ? ' (from --runner)' : ' (default predict for LongCoT text)'),
     );
   }
 
@@ -367,7 +395,7 @@ async function main(): Promise<void> {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const responsesPath = resolve(
     opts.outDir,
-    `longcot_rlm_${opts.domain}_${opts.difficulty}_${stamp}.jsonl`,
+    `longcot_${opts.runner}_${opts.domain}_${opts.difficulty}_${stamp}.jsonl`,
   );
 
   const questions = exportQuestions(opts);
@@ -395,12 +423,21 @@ async function main(): Promise<void> {
     });
   }
 
-  const rlm = new RLM('prompt: str -> answer: str', {
-    taskType: opts.taskType,
-    budget: {
-      maxOracleCalls: opts.maxOracleCalls,
-    },
-  });
+  const predictor =
+    !opts.dryRun && opts.runner === 'predict'
+      ? new Predict('prompt: str -> answer: str')
+      : null;
+  const rlm =
+    !opts.dryRun && opts.runner === 'rlm'
+      ? new RLM('prompt: str -> answer: str', {
+          taskType: opts.taskType,
+          budget: {
+            maxOracleCalls: opts.maxOracleCalls,
+          },
+        })
+      : null;
+
+  console.error(`[bench:longcot] runner=${opts.runner}`);
 
   const out = createWriteStream(responsesPath, { flags: 'w' });
 
@@ -418,8 +455,15 @@ async function main(): Promise<void> {
     } else {
       const t0 = Date.now();
       try {
-        const pred = await rlm.aforward({ prompt: q.prompt });
-        row.response_text = pred.getOr('answer', '');
+        if (predictor !== null) {
+          const pred = await predictor.aforward({ prompt: q.prompt });
+          row.response_text = pred.getOr('answer', '');
+        } else if (rlm !== null) {
+          const pred = await rlm.aforward({ prompt: q.prompt });
+          row.response_text = pred.getOr('answer', '');
+        } else {
+          row.error = 'internal: no predictor or rlm';
+        }
         row.latency_ms = Date.now() - t0;
       } catch (e) {
         row.error = e instanceof Error ? e.message : String(e);

@@ -13,8 +13,10 @@ uv sync
 ## Cost-safe order
 
 1. **`pnpm run bench:longcot:preflight`** (repo root) — one ~48-token Hugging Face completion; confirms `HF_TOKEN` / router / model id. Uses repo-root `.env` if `HF_TOKEN` is not exported.
-2. **`pnpm run bench:longcot:smoke`** — exactly **one** LongCoT question end-to-end through RLM with **hard caps** (summarise plan, ≤32 oracle calls, ≤2k completion tokens, no Gemini fallback in scoring).
-3. **Scale up** — increase `--max`, `--max-completion-tokens`, `--max-oracle-calls` deliberately. Runs with `--max > 20` or very high limits require **`--i-accept-cost`** so a typo does not launch a huge job.
+2. **`pnpm run bench:longcot:smoke`** — one **easy** LongCoT question end-to-end with **hard caps** and **`--runner predict`** by default (LongCoT expects free-text `solution = …`; full **RLM** oracle leaves need structured JSON). Use `--smoke --runner rlm` only if your LM reliably emits the effect-oracle wire format.
+3. **Scale up** — e.g. `pnpm run bench:longcot -- --runner predict --max 5 --domain logic --difficulty easy`. LongCoT-Mini is the **easy** slice (~100 per domain × 5 domains); this repo’s exporter is per `--domain` / `--difficulty`, so a full mini sweep is five domains × `--difficulty easy` (or extend `export_questions.py`). Runs with `--max > 20` or very high limits require **`--i-accept-cost`**.
+
+**Hugging Face router:** long-horizon LongCoT prompts can run for many minutes. The hosted gateway may return **504 HTML error pages** under load; that shows up as a row `error` in the JSONL, not as a TypeScript stack trace. Retry with a smaller `--max`, a lighter domain first, or a provider with a higher server-side timeout.
 
 ## Scripts
 
