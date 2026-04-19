@@ -138,7 +138,18 @@ export class Completions {
 // Prediction
 // ---------------------------------------------------------------------------
 
-export class Prediction {
+/**
+ * Completion-backed result container with numeric protocol and optional
+ * advisory output typing.
+ *
+ * The `TOutputs` generic is a **type-level annotation only**. The runtime
+ * store is untyped: whatever keys and values were passed to
+ * `Prediction.create` or `Prediction.fromCompletions` are stored verbatim.
+ * Callers with a string-literal `Signature` receive `TOutputs` propagated
+ * from `Predict<'q -> a'>` so `getTyped('a')` returns `string` at compile
+ * time, but nothing at runtime enforces this shape.
+ */
+export class Prediction<TOutputs extends Record<string, unknown> = Record<string, unknown>> {
   readonly completions: Completions | null;
   readonly #store: Map<string, unknown>;
 
@@ -150,16 +161,26 @@ export class Prediction {
     this.completions = completions;
   }
 
-  static create(data: Record<string, unknown>): Prediction {
-    return new Prediction(data, null);
+  /**
+   * Construct a `Prediction` with an advisory `TOut` type. The generic is
+   * intentionally decoupled from `data`: LM completions arrive as
+   * unstructured records, and forcing a runtime check would either duplicate
+   * the adapter's parsing contract or produce false-positive type errors at
+   * every call site. Pass `TOut` when you know (or assert) the data shape
+   * matches the declared outputs of the originating `Signature`.
+   */
+  static create<TOut extends Record<string, unknown> = Record<string, unknown>>(
+    data: Record<string, unknown>,
+  ): Prediction<TOut> {
+    return new Prediction<TOut>(data, null);
   }
 
-  static fromCompletions(
+  static fromCompletions<TOut extends Record<string, unknown> = Record<string, unknown>>(
     completionsData:
       | Readonly<Record<string, readonly unknown[]>>
       | readonly Readonly<Record<string, unknown>>[],
     signature: Signature | null = null,
-  ): Prediction {
+  ): Prediction<TOut> {
     const completionsMap = normalizeCompletionInput(completionsData);
     const store: Record<string, unknown> = {};
 
@@ -168,7 +189,7 @@ export class Prediction {
     }
 
     const completions = new Completions(completionsMap, signature);
-    return new Prediction(store, completions);
+    return new Prediction<TOut>(store, completions);
   }
 
   // --- Numeric protocol (requires "score" field) ---
@@ -179,6 +200,21 @@ export class Prediction {
     }
 
     return this.#store.get(key);
+  }
+
+  /**
+   * Typed counterpart to `get`. Throws `KeyError` on a missing key exactly
+   * like `get`, so the caller does not have to distinguish "key absent" from
+   * "value was undefined" at runtime. The returned type is the advisory
+   * `TOutputs[K]`; remember that the store is not validated against
+   * `TOutputs`, so the claim is structural, not load-bearing.
+   */
+  getTyped<K extends keyof TOutputs & string>(key: K): TOutputs[K] {
+    if (!this.#store.has(key)) {
+      throw new KeyError(`Key "${key}" not found in Prediction`);
+    }
+
+    return this.#store.get(key) as TOutputs[K];
   }
 
   getOr(key: string, defaultValue: unknown): unknown {
@@ -224,12 +260,12 @@ export class Prediction {
     return this.toDict();
   }
 
-  snapshot(): Prediction {
+  snapshot(): Prediction<TOutputs> {
     if (this.completions === null) {
-      return Prediction.create(this.toDict());
+      return Prediction.create<TOutputs>(this.toDict());
     }
 
-    return Prediction.fromCompletions(this.completions.toDict(), this.completions.signature);
+    return Prediction.fromCompletions<TOutputs>(this.completions.toDict(), this.completions.signature);
   }
 
   toFloat(): number {

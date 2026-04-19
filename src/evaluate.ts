@@ -26,9 +26,22 @@ export type EvaluationMetric<TScore = unknown> = (
   prediction: Prediction,
 ) => TScore | Promise<TScore>;
 
+/**
+ * Minimal duck-typed contract for a program that can be evaluated.
+ *
+ * The `call` / `acall` parameter type is declared as `any` so that typed
+ * subclasses like `Predict<'q -> a'>` (whose `.call` expects the narrower
+ * `{ q: string }`) remain assignable to this contract. Using `any` here is
+ * a deliberate, scoped escape from strict function-parameter variance: the
+ * runtime always passes a `Record<string, unknown>` derived from an
+ * example's declared inputs, and narrowing this contract to that record
+ * shape would reject every load-bearing typed predictor the library exposes.
+ */
 export interface EvaluateProgram {
-  readonly call: (kwargs: Record<string, unknown>) => Prediction;
-  readonly acall?: ((kwargs: Record<string, unknown>) => Promise<Prediction>) | undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  call(kwargs: any): Prediction;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  acall?(kwargs: any): Promise<Prediction>;
 }
 
 export interface EvaluateOptions<TScore = unknown> {
@@ -104,7 +117,8 @@ function numericScoreOf(score: unknown): number {
 }
 
 function hasAsyncProgram(program: EvaluateProgram): program is EvaluateProgram & {
-  readonly acall: (kwargs: Record<string, unknown>) => Promise<Prediction>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  acall(kwargs: any): Promise<Prediction>;
 } {
   return typeof program.acall === 'function';
 }

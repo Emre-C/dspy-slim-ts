@@ -20,7 +20,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
-    "pack:dry-run": "npm pack --dry-run",
+    "pack:dry-run": "pnpm pack --dry-run",
     "release:gate": "uv run ../benchmarks/release_gate.py",
     "bench:minimax-policy": "npx tsx tests/minimax_policy_benchmark.ts"
   },

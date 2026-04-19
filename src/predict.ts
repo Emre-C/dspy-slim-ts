@@ -17,10 +17,33 @@ import {
   createSignature,
   ensureSignature,
 } from './signature.js';
+import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
 
-export interface PredictTrace {
+/**
+ * Control-plane keys accepted alongside input fields in a single `.forward()`
+ * call, matching the runtime's `resolveSignature` / `resolveDemos` /
+ * `resolveConfig` / `resolveLm` branches. Callers with literal-string
+ * signatures should still be able to pass these without the type system
+ * treating them as excess input properties.
+ */
+export interface PredictForwardOverrides {
+  readonly signature?: Signature | string;
+  readonly demos?: readonly Demo[];
+  readonly config?: Record<string, unknown>;
+  readonly lm?: BaseLM;
+}
+
+/**
+ * Kwargs accepted by `Predict.forward` / `.call` / `.acall` / `.aforward`:
+ * the inferred inputs (possibly `Record<string, unknown>` for non-literal
+ * signatures) plus the four control-plane overrides.
+ */
+export type PredictKwargs<TInputs extends Record<string, unknown>> =
+  TInputs & PredictForwardOverrides;
+
+export interface PredictTrace<TOutputs extends Record<string, unknown> = Record<string, unknown>> {
   readonly inputs: Record<string, unknown>;
-  readonly prediction: Prediction;
+  readonly prediction: Prediction<TOutputs>;
 }
 
 export interface PredictPreprocessResult {
@@ -83,15 +106,35 @@ function firstDefined(...values: readonly unknown[]): unknown {
   return last;
 }
 
-export class Predict extends Module {
+/**
+ * A DSPy predictor.
+ *
+ * The three generic parameters form a pipeline:
+ *   - `TSig` is the constructor-argument shape (`string | Signature`). When a
+ *     string literal is passed, TypeScript infers `TSig = 'literal string'`;
+ *     when a `Signature` is passed, `TSig = Signature`; when a widened
+ *     `string` variable is passed, `TSig = string`.
+ *   - `TInputs` / `TOutputs` are derived from `TSig` via `InferInputs` /
+ *     `InferOutputs` so that only literal-string constructions see narrowed
+ *     records, and every other construction falls back to
+ *     `Record<string, unknown>`.
+ *
+ * The runtime behavior is independent of these generics — the source of truth
+ * remains the `Signature` object built by `ensurePredictSignature`.
+ */
+export class Predict<
+  TSig extends SignatureInput = Signature,
+  TInputs extends Record<string, unknown> = InferInputs<TSig>,
+  TOutputs extends Record<string, unknown> = InferOutputs<TSig>,
+> extends Module<PredictKwargs<TInputs>, TOutputs> {
   signature: Signature;
   config: Record<string, unknown>;
   lm: BaseLM | null = null;
   demos: readonly Record<string, unknown>[] = Object.freeze([]);
-  traces: readonly PredictTrace[] = Object.freeze([]);
+  traces: readonly PredictTrace<TOutputs>[] = Object.freeze([]);
   train: readonly unknown[] = Object.freeze([]);
 
-  constructor(signature: Signature | string, config: Record<string, unknown> = {}) {
+  constructor(signature: TSig, config: Record<string, unknown> = {}) {
     super();
     this.signature = ensurePredictSignature(signature);
     this.config = normalizeConfig(config);
@@ -106,19 +149,19 @@ export class Predict extends Module {
   }
 
   override call(
-    kwargs: Record<string, unknown> = EMPTY_RECORD,
+    kwargs: PredictKwargs<TInputs> = EMPTY_RECORD as PredictKwargs<TInputs>,
     ...positionalArgs: unknown[]
-  ): Prediction {
+  ): Prediction<TOutputs> {
     const normalizedKwargs = this.normalizeInvocation(kwargs, positionalArgs);
-    return super.call(normalizedKwargs);
+    return super.call(normalizedKwargs as PredictKwargs<TInputs>);
   }
 
   override async acall(
-    kwargs: Record<string, unknown> = EMPTY_RECORD,
+    kwargs: PredictKwargs<TInputs> = EMPTY_RECORD as PredictKwargs<TInputs>,
     ...positionalArgs: unknown[]
-  ): Promise<Prediction> {
+  ): Promise<Prediction<TOutputs>> {
     const normalizedKwargs = this.normalizeInvocation(kwargs, positionalArgs);
-    return super.acall(normalizedKwargs);
+    return super.acall(normalizedKwargs as PredictKwargs<TInputs>);
   }
 
   preprocess(kwargs: Record<string, unknown> = EMPTY_RECORD): PredictPreprocessResult {
@@ -251,11 +294,11 @@ export class Predict extends Module {
   buildPrediction(
     completions: readonly Readonly<Record<string, unknown>>[],
     signature: Signature,
-  ): Prediction {
-    return Prediction.fromCompletions(completions, signature);
+  ): Prediction<TOutputs> {
+    return Prediction.fromCompletions<TOutputs>(completions, signature);
   }
 
-  appendTrace(inputs: Record<string, unknown>, prediction: Prediction): void {
+  appendTrace(inputs: Record<string, unknown>, prediction: Prediction<TOutputs>): void {
     this.traces = Object.freeze([
       ...this.traces,
       Object.freeze({
@@ -277,9 +320,9 @@ export class Predict extends Module {
   }
 
   override forward(
-    kwargs: Record<string, unknown> = EMPTY_RECORD,
+    kwargs: PredictKwargs<TInputs> = EMPTY_RECORD as PredictKwargs<TInputs>,
     ...positionalArgs: unknown[]
-  ): Prediction {
+  ): Prediction<TOutputs> {
     const normalizedKwargs = this.normalizeInvocation(kwargs, positionalArgs);
     const { adapter, lm, signature, demos, config, inputs } = this.preprocess(normalizedKwargs);
     const completions = adapter.call(lm, config, signature, demos, inputs);
@@ -289,9 +332,9 @@ export class Predict extends Module {
   }
 
   override async aforward(
-    kwargs: Record<string, unknown> = EMPTY_RECORD,
+    kwargs: PredictKwargs<TInputs> = EMPTY_RECORD as PredictKwargs<TInputs>,
     ...positionalArgs: unknown[]
-  ): Promise<Prediction> {
+  ): Promise<Prediction<TOutputs>> {
     const normalizedKwargs = this.normalizeInvocation(kwargs, positionalArgs);
     const { adapter, lm, signature, demos, config, inputs } = this.preprocess(normalizedKwargs);
     const completions = await adapter.acall(lm, config, signature, demos, inputs);
@@ -317,7 +360,7 @@ export class Predict extends Module {
   }
 
   private normalizeInvocation(
-    kwargs: Record<string, unknown>,
+    kwargs: PredictKwargs<TInputs> | Record<string, unknown>,
     positionalArgs: readonly unknown[],
   ): Record<string, unknown> {
     if (positionalArgs.length > 0) {
@@ -328,7 +371,7 @@ export class Predict extends Module {
       throw new ValueError(this.positionalArgsErrorMessage());
     }
 
-    return snapshotRecord(kwargs);
+    return snapshotRecord(kwargs as Record<string, unknown>);
   }
 
   private positionalArgsErrorMessage(): string {
@@ -338,7 +381,7 @@ export class Predict extends Module {
   private extractInputKwargs(kwargs: Record<string, unknown>): Record<string, unknown> {
     const inputs: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(kwargs)) {
-      if (key === 'signature' || key === 'demos' || key === 'config' || key === 'lm') {
+      if (RESERVED_PREDICT_INPUT_KEYS.has(key)) {
         continue;
       }
 
@@ -363,6 +406,16 @@ export class Predict extends Module {
     return filtered;
   }
 
+  /**
+   * Sampling multiple completions (`n > 1`) at a near-zero temperature produces
+   * near-identical outputs, which defeats the purpose of sampling and wastes
+   * tokens. When the caller asks for multiple generations without raising
+   * temperature, we bump it to 0.7 so the generations actually differ. Mirrors
+   * the same heuristic in upstream DSPy; see `dspy/predict/predict.py`.
+   *
+   * The 0.15 ceiling is intentionally generous: any temperature above it is
+   * treated as "the caller knows what they're doing" and left alone.
+   */
   private applyTemperatureAutoAdjust(config: Record<string, unknown>, lm: BaseLM): void {
     const effectiveTemperature = firstDefined(config.temperature, lm.kwargs.temperature);
     const effectiveGenerations = firstDefined(config.n, lm.kwargs.n, lm.kwargs.num_generations, 1);

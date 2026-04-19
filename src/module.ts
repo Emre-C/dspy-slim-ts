@@ -185,18 +185,33 @@ export abstract class BaseModule {
   }
 }
 
-export abstract class Module extends BaseModule {
+/**
+ * Generic base for every DSPy module. `TInputs` names the kwargs shape
+ * accepted by `forward`/`call`; `TOutputs` names the output record shape
+ * carried by the returned `Prediction`. Both default to
+ * `Record<string, unknown>` so existing subclasses that did not declare
+ * generics keep their current (permissive) runtime surface.
+ *
+ * Typed subclasses (`Predict<'q -> a'>`, `ChainOfThought<'q -> a'>`, etc.)
+ * substitute narrower types here so that `.forward({...})` gets
+ * excess-property checks and the returned prediction exposes `TOutputs`
+ * through `Prediction.getTyped(...)`.
+ */
+export abstract class Module<
+  TInputs extends Record<string, unknown> = Record<string, unknown>,
+  TOutputs extends Record<string, unknown> = Record<string, unknown>,
+> extends BaseModule {
   _compiled = false;
   callbacks: Callback[] = [];
   history: HistoryEntry[] = [];
 
-  abstract forward(kwargs: Record<string, unknown>): Prediction;
+  abstract forward(kwargs: TInputs): Prediction<TOutputs>;
 
-  async aforward(kwargs: Record<string, unknown>): Promise<Prediction> {
+  async aforward(kwargs: TInputs): Promise<Prediction<TOutputs>> {
     return this.forward(kwargs);
   }
 
-  call(kwargs: Record<string, unknown>): Prediction {
+  call(kwargs: TInputs): Prediction<TOutputs> {
     return runWithCallbacks({
       kind: 'module',
       instance: this,
@@ -205,11 +220,11 @@ export abstract class Module extends BaseModule {
         const callerModules = appendUnique(settings.callerModules, this);
         return settings.context({ callerModules }, () => this.forward(kwargs));
       },
-    });
+    }) as Prediction<TOutputs>;
   }
 
-  async acall(kwargs: Record<string, unknown>): Promise<Prediction> {
-    return runWithCallbacksAsync({
+  async acall(kwargs: TInputs): Promise<Prediction<TOutputs>> {
+    return (await runWithCallbacksAsync({
       kind: 'module',
       instance: this,
       inputs: kwargs,
@@ -217,7 +232,7 @@ export abstract class Module extends BaseModule {
         const callerModules = appendUnique(settings.callerModules, this);
         return settings.context({ callerModules }, () => this.aforward(kwargs));
       },
-    });
+    })) as Prediction<TOutputs>;
   }
 
   namedPredictors(): Array<[string, BaseModule & PredictorLike]> {

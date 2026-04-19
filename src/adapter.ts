@@ -16,6 +16,7 @@ import {
   snapshotOwnedValue,
   snapshotRecord,
 } from './owned_value.js';
+import { resolveProfile } from './providers/index.js';
 import { deleteField, Signature, signatureString } from './signature.js';
 import { Tool, ToolCalls } from './tool.js';
 import type { Role, TypeTag } from './types.js';
@@ -300,58 +301,6 @@ function parseLooseJsonObject(source: string): Record<string, unknown> | null {
   return null;
 }
 
-function isOpenRouterMinimaxModel(model: string): boolean {
-  return model.toLowerCase().startsWith('openrouter/minimax/');
-}
-
-function hasExplicitOpenRouterMinimaxReasoningOverride(
-  lmKwargs: Record<string, unknown>,
-): boolean {
-  if (lmKwargs.reasoning !== undefined) {
-    return true;
-  }
-
-  const extraBody = isPlainObject(lmKwargs.extra_body)
-    ? lmKwargs.extra_body
-    : isPlainObject(lmKwargs.extraBody)
-      ? lmKwargs.extraBody
-      : null;
-
-  return isPlainObject(extraBody) && extraBody.reasoning !== undefined;
-}
-
-function shouldRetryWithOpenRouterMinimaxFallback(
-  lm: BaseLM,
-  lmKwargs: Record<string, unknown>,
-  error: unknown,
-): error is AdapterParseError {
-  return error instanceof AdapterParseError
-    && isOpenRouterMinimaxModel(lm.model)
-    && !hasExplicitOpenRouterMinimaxReasoningOverride(lmKwargs);
-}
-
-function withOpenRouterMinimaxMinimalReasoning(
-  lmKwargs: Record<string, unknown>,
-): Record<string, unknown> {
-  const nextKwargs = snapshotRecord(lmKwargs);
-  const extraBody = isPlainObject(nextKwargs.extra_body)
-    ? snapshotRecord(nextKwargs.extra_body)
-    : isPlainObject(nextKwargs.extraBody)
-      ? snapshotRecord(nextKwargs.extraBody)
-      : {};
-
-  delete nextKwargs.extraBody;
-  nextKwargs.extra_body = snapshotRecord({
-    ...extraBody,
-    reasoning: {
-      exclude: true,
-      effort: 'minimal',
-    },
-  });
-
-  return nextKwargs;
-}
-
 export class AdapterParseError extends RuntimeError {
   readonly adapterName: string;
   readonly signature: Signature;
@@ -407,11 +356,12 @@ export abstract class Adapter {
     try {
       return parseOutputs(processed.lmKwargs);
     } catch (error) {
-      if (!shouldRetryWithOpenRouterMinimaxFallback(lm, processed.lmKwargs, error)) {
+      const profile = resolveProfile(lm.model);
+      const retryKwargs = profile?.adapterRetry?.(lm, processed.lmKwargs, error) ?? null;
+      if (retryKwargs === null) {
         throw error;
       }
-      return parseOutputs(withOpenRouterMinimaxMinimalReasoning(processed.lmKwargs));
-
+      return parseOutputs(retryKwargs);
     }
   }
 
@@ -437,10 +387,12 @@ export abstract class Adapter {
     try {
       return await parseOutputs(processed.lmKwargs);
     } catch (error) {
-      if (!shouldRetryWithOpenRouterMinimaxFallback(lm, processed.lmKwargs, error)) {
+      const profile = resolveProfile(lm.model);
+      const retryKwargs = profile?.adapterRetry?.(lm, processed.lmKwargs, error) ?? null;
+      if (retryKwargs === null) {
         throw error;
       }
-      return parseOutputs(withOpenRouterMinimaxMinimalReasoning(processed.lmKwargs));
+      return parseOutputs(retryKwargs);
     }
   }
 

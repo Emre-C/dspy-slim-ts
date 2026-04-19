@@ -17,12 +17,21 @@ import {
   ensureSignature,
   type Signature,
 } from './signature.js';
+import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
 import { Tool } from './tool.js';
 
 const EMPTY_RECORD = Object.freeze({}) as Record<string, unknown>;
 const MAX_TRUNCATION_ATTEMPTS = 3;
 const TRAJECTORY_KEYS_PER_STEP = 4;
 const RESERVED_REACT_INPUT_KEYS = new Set(['trajectory', 'max_iters']);
+
+/**
+ * Kwargs accepted by `ReAct.forward` / `.aforward`: the inferred inputs plus
+ * the optional `max_iters` control override extracted in
+ * `normalizeInvocation`.
+ */
+export type ReActKwargs<TInputs extends Record<string, unknown>> =
+  TInputs & { readonly max_iters?: number };
 
 type ToolInput = Tool | ((...args: unknown[]) => unknown);
 
@@ -177,14 +186,18 @@ function formatExecutionError(toolName: string, error: unknown): string {
   return `Execution error in ${toolName}: ${String(error)}`;
 }
 
-export class ReAct extends Module {
+export class ReAct<
+  TSig extends SignatureInput = Signature,
+  TInputs extends Record<string, unknown> = InferInputs<TSig>,
+  TOutputs extends Record<string, unknown> = InferOutputs<TSig>,
+> extends Module<ReActKwargs<TInputs>, TOutputs> {
   readonly signature: Signature;
   readonly maxIters: number;
   readonly tools: ReadonlyMap<string, Tool>;
   readonly react: Predict;
   readonly extract: ChainOfThought;
 
-  constructor(signature: Signature | string, tools: readonly ToolInput[], maxIters = 20) {
+  constructor(signature: TSig, tools: readonly ToolInput[], maxIters = 20) {
     super();
     this.signature = ensureReactCompatibleSignature(ensureSignature(signature));
     this.maxIters = maxIters;
@@ -204,7 +217,7 @@ export class ReAct extends Module {
     return Object.fromEntries(entries.slice(TRAJECTORY_KEYS_PER_STEP));
   }
 
-  override forward(kwargs: Record<string, unknown> = EMPTY_RECORD): Prediction {
+  override forward(kwargs: ReActKwargs<TInputs> = EMPTY_RECORD as ReActKwargs<TInputs>): Prediction<TOutputs> {
     const { inputArgs, maxIters } = this.normalizeInvocation(kwargs);
     let trajectory: Record<string, unknown> = {};
 
@@ -237,13 +250,13 @@ export class ReAct extends Module {
     }
 
     const extractResult = this.callWithPotentialTrajectoryTruncation(this.extract, trajectory, inputArgs);
-    return Prediction.create({
+    return Prediction.create<TOutputs>({
       trajectory: extractResult.trajectory,
       ...extractResult.prediction.toDict(),
     });
   }
 
-  override async aforward(kwargs: Record<string, unknown> = EMPTY_RECORD): Promise<Prediction> {
+  override async aforward(kwargs: ReActKwargs<TInputs> = EMPTY_RECORD as ReActKwargs<TInputs>): Promise<Prediction<TOutputs>> {
     const { inputArgs, maxIters } = this.normalizeInvocation(kwargs);
     let trajectory: Record<string, unknown> = {};
 
@@ -276,7 +289,7 @@ export class ReAct extends Module {
     }
 
     const extractResult = await this.acallWithPotentialTrajectoryTruncation(this.extract, trajectory, inputArgs);
-    return Prediction.create({
+    return Prediction.create<TOutputs>({
       trajectory: extractResult.trajectory,
       ...extractResult.prediction.toDict(),
     });

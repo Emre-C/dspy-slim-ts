@@ -2,7 +2,6 @@
  * §6 — Language model contract and OpenAI-compatible runtime.
  */
 
-import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { Message } from './adapter.js';
 import type { Callback } from './callback.js';
@@ -10,6 +9,8 @@ import { runWithCallbacks, runWithCallbacksAsync } from './callback.js';
 import { ConfigurationError, ContextWindowExceededError, RuntimeError } from './exceptions.js';
 import { isPlainObject } from './guards.js';
 import { snapshotOwnedValue, snapshotRecord } from './owned_value.js';
+import { resolveProfile } from './providers/index.js';
+import { providerModelName, providerNameFromModel } from './providers/model_id.js';
 import { settings } from './settings.js';
 import type { ModelType } from './types.js';
 
@@ -136,23 +137,6 @@ class OpenAIRequestError extends Error {
     this.code = options.code ?? null;
     this.body = options.body;
   }
-}
-
-function providerNameFromModel(model: string): string {
-  if (model.includes('/')) {
-    return model.split('/', 1)[0]!.toLowerCase();
-  }
-
-  return 'openai';
-}
-
-function providerModelName(model: string): string {
-  const provider = providerNameFromModel(model);
-  if ((provider === 'openai' || provider === 'openrouter') && model.includes('/')) {
-    return model.split('/').slice(1).join('/');
-  }
-
-  return model;
 }
 
 function providerEnvName(provider: string, suffix: string): string {
@@ -450,62 +434,6 @@ function mergeExtraBody(request: Record<string, unknown>): Record<string, unknow
   };
 }
 
-function isOpenRouterMinimaxModel(model: string): boolean {
-  return providerNameFromModel(model) === 'openrouter'
-    && providerModelName(model).toLowerCase().startsWith('minimax/');
-}
-
-function applyOpenRouterMinimaxReasoningDefaults(
-  model: string,
-  request: Record<string, unknown>,
-): Record<string, unknown> {
-  if (!isOpenRouterMinimaxModel(model)) {
-    return request;
-  }
-
-  if (request.reasoning !== undefined) {
-    return request;
-  }
-
-  return {
-    ...request,
-    reasoning: {
-      exclude: true,
-    },
-  };
-}
-
-function applyOpenRouterMinimaxOutputFloor(request: Record<string, unknown>): Record<string, unknown> {
-  const minimumOutputTokens = 4096;
-  const normalized = { ...request };
-
-  if (typeof normalized.max_tokens === 'number' && Number.isFinite(normalized.max_tokens)) {
-    normalized.max_tokens = Math.max(normalized.max_tokens, minimumOutputTokens);
-    return normalized;
-  }
-
-  if (typeof normalized.max_output_tokens === 'number' && Number.isFinite(normalized.max_output_tokens)) {
-    normalized.max_output_tokens = Math.max(normalized.max_output_tokens, minimumOutputTokens);
-    return normalized;
-  }
-
-  normalized.max_tokens = minimumOutputTokens;
-  return normalized;
-}
-
-function applyOpenRouterMinimaxRequestDefaults(
-  model: string,
-  request: Record<string, unknown>,
-): Record<string, unknown> {
-  if (!isOpenRouterMinimaxModel(model)) {
-    return request;
-  }
-
-  return applyOpenRouterMinimaxOutputFloor(
-    applyOpenRouterMinimaxReasoningDefaults(model, request),
-  );
-}
-
 function convertContentPartForResponses(part: Record<string, unknown>): Record<string, unknown> {
   if (part.type === 'image_url' && isPlainObject(part.image_url)) {
     return {
@@ -607,76 +535,6 @@ function buildTransportOptions(
     },
     request: requestCopy,
   };
-}
-
-function parseCurlResponse(rawOutput: string): { readonly status: number; readonly body: unknown } {
-  const separatorIndex = rawOutput.lastIndexOf('\n');
-  if (separatorIndex === -1) {
-    throw new OpenAIRequestError('Malformed curl response from OpenAI-compatible transport.');
-  }
-
-  const bodyText = rawOutput.slice(0, separatorIndex);
-  const statusText = rawOutput.slice(separatorIndex + 1).trim();
-  const status = Number(statusText);
-  if (!Number.isInteger(status)) {
-    throw new OpenAIRequestError(`Malformed HTTP status from OpenAI-compatible transport: ${statusText}`);
-  }
-
-  let body: unknown = bodyText;
-  if (bodyText.trim() !== '') {
-    try {
-      body = JSON.parse(bodyText);
-    } catch {
-      body = bodyText;
-    }
-  }
-
-  return { status, body };
-}
-
-function runSyncRequest(
-  url: string,
-  body: Record<string, unknown>,
-  options: TransportOptions,
-): unknown {
-  const headers = {
-    Authorization: `Bearer ${options.apiKey}`,
-    'Content-Type': 'application/json',
-    'User-Agent': 'dspy-slim-ts/0.1.0',
-    ...(options.organization ? { 'OpenAI-Organization': options.organization } : {}),
-    ...(options.project ? { 'OpenAI-Project': options.project } : {}),
-    ...options.headers,
-  };
-
-  const args = ['--silent', '--show-error', '-X', 'POST', url];
-  for (const [name, value] of Object.entries(headers)) {
-    args.push('-H', `${name}: ${value}`);
-  }
-  args.push('-d', JSON.stringify(body), '-w', '\n%{http_code}');
-
-  try {
-    const output = execFileSync('curl', args, { encoding: 'utf8' });
-    const { status, body: responseBody } = parseCurlResponse(output);
-    if (status < 200 || status >= 300) {
-      throw new OpenAIRequestError(errorMessageFromBody(responseBody), {
-        status,
-        code: errorCodeFromBody(responseBody),
-        body: responseBody,
-      });
-    }
-
-    return responseBody;
-  } catch (error) {
-    if (error instanceof OpenAIRequestError) {
-      throw error;
-    }
-
-    if (error instanceof Error) {
-      throw new OpenAIRequestError(error.message);
-    }
-
-    throw new OpenAIRequestError(String(error));
-  }
 }
 
 async function runAsyncRequest(
@@ -989,13 +847,20 @@ export class LM extends BaseLM {
     return this.supportsResponseSchema ? RESPONSE_FORMAT_PARAMS : new Set<string>();
   }
 
+  /**
+   * @deprecated `LM` no longer supports synchronous HTTP transport. Use
+   * {@link LM.acall} or {@link LM.aforward} instead. This override is kept
+   * so that existing sync call sites fail with a clear runtime error rather
+   * than a confusing `this.generate is not a function`, and is scheduled for
+   * removal in the next minor release. See
+   * `docs/product/sync-lm-removal.md` for the rationale.
+   */
   override forward(
-    prompt?: string,
-    messages?: readonly Message[],
-    kwargs: Record<string, unknown> = {},
-  ): LMResponse {
-    const mergedKwargs = this.mergeKwargs(kwargs);
-    return this.requestWithRetries(false, prompt, messages, mergedKwargs) as LMResponse;
+    _prompt?: string,
+    _messages?: readonly Message[],
+    _kwargs: Record<string, unknown> = {},
+  ): never {
+    throw new RuntimeError('LM is async-only. Use acall() or aforward() instead.');
   }
 
   override async aforward(
@@ -1004,50 +869,20 @@ export class LM extends BaseLM {
     kwargs: Record<string, unknown> = {},
   ): Promise<LMResponse> {
     const mergedKwargs = this.mergeKwargs(kwargs);
-    return this.requestWithRetries(true, prompt, messages, mergedKwargs) as Promise<LMResponse>;
+    return this.requestWithRetries(prompt, messages, mergedKwargs);
   }
 
-  private requestWithRetries(
-    asyncMode: boolean,
+  private async requestWithRetries(
     prompt: string | undefined,
     messages: readonly Message[] | undefined,
     mergedKwargs: Record<string, unknown>,
-  ): LMResponse | Promise<LMResponse> {
+  ): Promise<LMResponse> {
     const normalizedMessages = normalizeMessages(prompt, messages);
-
-    if (asyncMode) {
-      return (async () => {
-        let lastError: unknown = null;
-
-        for (let attempt = 0; attempt <= this.numRetries; attempt += 1) {
-          try {
-            const response = await this.performRequest(true, normalizedMessages, mergedKwargs);
-            assertLMResponseShape(response);
-            return response;
-          } catch (error) {
-            lastError = error;
-            if (looksLikeContextWindowExceeded(error)) {
-              const message = error instanceof Error ? error.message : 'Context window exceeded';
-              throw new ContextWindowExceededError({ model: this.model, message });
-            }
-
-            if (attempt >= this.numRetries || !retryableError(error)) {
-              throw error;
-            }
-
-            await delay(100 * (2 ** attempt));
-          }
-        }
-
-        throw lastError instanceof Error ? lastError : new Error(String(lastError));
-      })();
-    }
-
     let lastError: unknown = null;
 
     for (let attempt = 0; attempt <= this.numRetries; attempt += 1) {
       try {
-        const response = this.performRequest(false, normalizedMessages, mergedKwargs);
+        const response = await this.performRequest(normalizedMessages, mergedKwargs);
         assertLMResponseShape(response);
         return response;
       } catch (error) {
@@ -1060,17 +895,18 @@ export class LM extends BaseLM {
         if (attempt >= this.numRetries || !retryableError(error)) {
           throw error;
         }
+
+        await delay(100 * (2 ** attempt));
       }
     }
 
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  private performRequest(
-    asyncMode: boolean,
+  private async performRequest(
     messages: readonly Message[],
     mergedKwargs: Record<string, unknown>,
-  ): LMResponse | Promise<LMResponse> {
+  ): Promise<LMResponse> {
     const request = {
       model: providerModelName(this.model),
       messages,
@@ -1100,12 +936,9 @@ export class LM extends BaseLM {
       ? convertChatRequestToResponsesRequest(transport.request, this.useDeveloperRole)
       : transport.request;
     body = mergeExtraBody(body);
-    body = applyOpenRouterMinimaxRequestDefaults(this.model, body);
+    const profile = resolveProfile(this.model);
+    body = profile?.mapRequest?.(body) ?? body;
 
-    if (asyncMode) {
-      return runAsyncRequest(url, body, transport, this.#fetchImpl) as Promise<LMResponse>;
-    }
-
-    return runSyncRequest(url, body, transport) as LMResponse;
+    return runAsyncRequest(url, body, transport, this.#fetchImpl) as Promise<LMResponse>;
   }
 }

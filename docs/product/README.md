@@ -41,14 +41,20 @@ Good topics:
 
 Use short sections like these:
 
-- `Status`
 - `Decision`
 - `Why`
 - `What This Means In Code`
 - `Revisit If`
 
+The single `#` title is the decision name (e.g. `# Provider Profile Boundary`).
+No separate date, status, or context headers — the commit history already tracks
+those, and the document itself should be stable enough not to need them.
+
 ## Current Decision Records
 
-- [Spec Authority And Oracle Boundary](file:///Users/emre/codebase/minimal_dspy/dspy-slim-ts/docs/product/spec-authority-and-oracle-boundary.md)
-- [Runtime Spine And Traversal Semantics](file:///Users/emre/codebase/minimal_dspy/dspy-slim-ts/docs/product/runtime-spine-and-traversal-semantics.md)
-- [LM Adapter Predict Boundary](file:///Users/emre/codebase/minimal_dspy/dspy-slim-ts/docs/product/lm-adapter-predict-boundary.md)
+- [Spec Authority And Oracle Boundary](./spec-authority-and-oracle-boundary.md)
+- [Runtime Spine And Traversal Semantics](./runtime-spine-and-traversal-semantics.md)
+- [LM Adapter Predict Boundary](./lm-adapter-predict-boundary.md)
+- [Sync LM Removal](./sync-lm-removal.md)
+- [Provider Profile Boundary](./provider-profile-boundary.md)
+- [Type-Level Signature Inference](./type-level-signature-inference.md)

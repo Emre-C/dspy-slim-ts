@@ -12,7 +12,8 @@ import { createNodeCodeInterpreter, type SyncCodeInterpreter, type SyncCodeSessi
 import { Prediction } from './prediction.js';
 import { Predict } from './predict.js';
 import { settings } from './settings.js';
-import { createSignature, ensureSignature } from './signature.js';
+import { createSignature, ensureSignature, type Signature } from './signature.js';
+import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
 import { Tool } from './tool.js';
 import type {
   BudgetVector,
@@ -242,7 +243,11 @@ function isSyncSession(session: unknown): session is SyncCodeSession {
     && typeof (session as SyncCodeSession).inspectGlobalsSync === 'function';
 }
 
-export class RLM extends Module {
+export class RLM<
+  TSig extends SignatureInput = Signature,
+  TInputs extends Record<string, unknown> = InferInputs<TSig>,
+  TOutputs extends Record<string, unknown> = InferOutputs<TSig>,
+> extends Module<TInputs, TOutputs> {
   readonly signature: ReturnType<typeof ensureSignature>;
   readonly config: RLMConfig;
   readonly generateAction: Predict;
@@ -252,7 +257,7 @@ export class RLM extends Module {
 
   subLm: BaseLM | null;
 
-  constructor(signature: Parameters<typeof ensureSignature>[0], options: RLMOptions = {}) {
+  constructor(signature: TSig, options: RLMOptions = {}) {
     super();
     this.signature = ensureSignature(signature);
     const budget = buildBudgetVector(options.budget);
@@ -274,7 +279,7 @@ export class RLM extends Module {
     this.extract = new Predict(createExtractSignature(this.signature));
   }
 
-  override forward(kwargs: Record<string, unknown> = EMPTY_RECORD): Prediction {
+  override forward(kwargs: TInputs = EMPTY_RECORD as TInputs): Prediction<TOutputs> {
     if (!isPlainObject(kwargs)) {
       throw new ValueError('RLM expects a single plain-object argument.');
     }
@@ -287,16 +292,16 @@ export class RLM extends Module {
       throw new RuntimeError('RLM.forward requires a synchronous interpreter session implementation.');
     }
 
-    return this.runWithSyncSession(session, kwargs);
+    return this.runWithSyncSession(session, kwargs as Record<string, unknown>);
   }
 
-  override async aforward(kwargs: Record<string, unknown> = EMPTY_RECORD): Promise<Prediction> {
+  override async aforward(kwargs: TInputs = EMPTY_RECORD as TInputs): Promise<Prediction<TOutputs>> {
     if (!isPlainObject(kwargs)) {
       throw new ValueError('RLM expects a single plain-object argument.');
     }
 
     const session = await this.interpreter.createSession();
-    return this.runWithAsyncSession(session, kwargs);
+    return this.runWithAsyncSession(session, kwargs as Record<string, unknown>);
   }
 
   // ── Shared loop helpers ──────────────────────────────────────────────
@@ -336,7 +341,7 @@ export class RLM extends Module {
   ): {
     history: REPLHistory;
     fault: CodeInterpreterError | null;
-    prediction: Prediction | null;
+    prediction: Prediction<TOutputs> | null;
     variables: readonly REPLVariable[];
   } {
     const symbols = variables.map((variable) => variable.symbol);
@@ -368,7 +373,7 @@ export class RLM extends Module {
     extracted: Prediction,
     history: REPLHistory,
     fault: CodeInterpreterError | null,
-  ): Prediction {
+  ): Prediction<TOutputs> {
     const outputs = this.normalizeExtractedOutput(extracted);
     const historyWithExtract = appendHistory(
       history,
@@ -393,7 +398,7 @@ export class RLM extends Module {
   private runWithSyncSession(
     session: SyncCodeSession,
     kwargs: Record<string, unknown>,
-  ): Prediction {
+  ): Prediction<TOutputs> {
     this.validateInputs(kwargs);
     const state = this.createEmptyLoopState();
 
@@ -441,7 +446,7 @@ export class RLM extends Module {
       readonly close: SyncCodeSession['close'];
     },
     kwargs: Record<string, unknown>,
-  ): Promise<Prediction> {
+  ): Promise<Prediction<TOutputs>> {
     this.validateInputs(kwargs);
     const state = this.createEmptyLoopState();
 
@@ -586,7 +591,7 @@ export class RLM extends Module {
     result: Extract<ExecuteResult<unknown>, { readonly tag: 'submit' }>,
     history: REPLHistory,
     fault: CodeInterpreterError | null,
-  ): Prediction {
+  ): Prediction<TOutputs> {
     const outputs = this.normalizeSubmittedOutput(result.output.value);
     const payload: Record<string, unknown> = {
       ...outputs,
@@ -598,14 +603,14 @@ export class RLM extends Module {
       payload.repl_error = fault;
     }
 
-    return Prediction.create(payload);
+    return Prediction.create<TOutputs>(payload);
   }
 
   private finalizeExtractPrediction(
     outputs: Record<string, unknown>,
     history: REPLHistory,
     fault: CodeInterpreterError | null,
-  ): Prediction {
+  ): Prediction<TOutputs> {
     const payload: Record<string, unknown> = {
       ...outputs,
       final_via: 'extract',
@@ -614,6 +619,6 @@ export class RLM extends Module {
       payload.repl_history = history;
       payload.repl_error = fault;
     }
-    return Prediction.create(payload);
+    return Prediction.create<TOutputs>(payload);
   }
 }

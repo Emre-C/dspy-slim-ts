@@ -41,6 +41,15 @@ export {
   signatureFromString,
 } from './signature.js';
 
+export type {
+  ParseSignature,
+  IsStringLiteral,
+  InferInputs,
+  InferOutputs,
+  SignatureInput,
+  Flatten,
+} from './signature_types.js';
+
 export { Example } from './example.js';
 
 export type { HistoryMessage } from './history.js';
@@ -77,6 +86,9 @@ export type {
 } from './lm.js';
 export { BaseLM, LM, getGlobalHistory, resetGlobalHistory } from './lm.js';
 
+export type { ProviderProfile } from './providers/profile.js';
+export { registerProfile, resolveProfile } from './providers/index.js';
+
 export type { GoldenTranscriptEntry } from './replay_lm.js';
 export { ReplayLM } from './replay_lm.js';
 
@@ -88,7 +100,12 @@ export {
   markPredictor,
 } from './module.js';
 
-export type { PredictTrace, PredictPreprocessResult } from './predict.js';
+export type {
+  PredictTrace,
+  PredictPreprocessResult,
+  PredictForwardOverrides,
+  PredictKwargs,
+} from './predict.js';
 export { Predict } from './predict.js';
 
 export type {
@@ -114,6 +131,7 @@ export type {
 export { Evaluate, EvaluationResult } from './evaluate.js';
 
 export { ChainOfThought } from './chain_of_thought.js';
+export type { ReActKwargs } from './react.js';
 export { ReAct } from './react.js';
 export type {
   BudgetVector,

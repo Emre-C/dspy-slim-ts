@@ -1,23 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import {
   ContextWindowExceededError,
   LM,
   Module,
   Prediction,
+  RuntimeError,
   getGlobalHistory,
   resetGlobalHistory,
   settings,
   type Message,
 } from '../src/index.js';
-
-vi.mock('node:child_process', async () => {
-  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
-  return {
-    ...actual,
-    execFileSync: vi.fn(),
-  };
-});
 
 class HistoryModule extends Module {
   override forward(): Prediction {
@@ -32,70 +24,86 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function requestBodyFromExecFileSyncCall(callIndex: number): Record<string, unknown> {
-  const call = vi.mocked(execFileSync).mock.calls[callIndex];
+function mockFetch(
+  ...responses: Array<{ status?: number; body: unknown }>
+): ReturnType<typeof vi.fn> {
+  const mock = vi.fn();
+  for (const { status = 200, body } of responses) {
+    mock.mockResolvedValueOnce({
+      ok: status >= 200 && status < 300,
+      status,
+      text: async () => JSON.stringify(body),
+    });
+  }
+  return mock;
+}
+
+function requestBodyFromFetchCall(
+  fetchMock: ReturnType<typeof vi.fn>,
+  callIndex: number,
+): Record<string, unknown> {
+  const call = fetchMock.mock.calls[callIndex] as [string, { body: string }] | undefined;
   if (!call) {
-    throw new Error(`Missing execFileSync mock call at index ${callIndex}.`);
+    throw new Error(`Missing fetch mock call at index ${callIndex}.`);
   }
-  const args = call[1];
-  if (!Array.isArray(args)) {
-    throw new Error('Expected mocked curl invocation arguments to be present.');
-  }
-  const bodyIndex = args.indexOf('-d');
-  if (bodyIndex === -1) {
-    throw new Error('Expected mocked curl invocation to include a -d request body flag.');
-  }
-
-  const body = args[bodyIndex + 1];
-  if (typeof body !== 'string') {
-    throw new Error('Expected mocked curl request body to be a string.');
-  }
-
-  return JSON.parse(body) as Record<string, unknown>;
+  return JSON.parse(call[1].body) as Record<string, unknown>;
 }
 
 describe('LM', () => {
-  it('normalizes chat completions and updates global, LM, and module history', () => {
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce(`${JSON.stringify({
-        model: 'gpt-4.1-mini',
-        choices: [
-          {
-            message: { content: 'hello' },
-            finish_reason: 'stop',
-          },
-        ],
-        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
-      })}\n200`)
-      .mockReturnValueOnce(`${JSON.stringify({
-        model: 'gpt-4.1-mini',
-        choices: [
-          {
-            message: {
-              content: 'world',
-              tool_calls: [
-                {
-                  id: 'call_1',
-                  type: 'function',
-                  function: { name: 'lookup', arguments: '{"city":"Paris"}' },
-                },
-              ],
-            },
-            finish_reason: 'stop',
-            logprobs: { tokens: [] },
-          },
-        ],
-        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
-      })}\n200`);
-
+  it('LM.forward() throws async-only error', () => {
     const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test' });
+    expect(() => lm.forward(undefined, [{ role: 'user', content: 'hi' }])).toThrow(RuntimeError);
+    expect(() => lm.forward(undefined, [{ role: 'user', content: 'hi' }])).toThrow(
+      'LM is async-only',
+    );
+  });
+
+  it('normalizes chat completions and updates global, LM, and module history', async () => {
+    const fetchMock = mockFetch(
+      {
+        body: {
+          model: 'gpt-4.1-mini',
+          choices: [
+            {
+              message: { content: 'hello' },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+        },
+      },
+      {
+        body: {
+          model: 'gpt-4.1-mini',
+          choices: [
+            {
+              message: {
+                content: 'world',
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    type: 'function',
+                    function: { name: 'lookup', arguments: '{"city":"Paris"}' },
+                  },
+                ],
+              },
+              finish_reason: 'stop',
+              logprobs: { tokens: [] },
+            },
+          ],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        },
+      },
+    );
+
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', fetch: fetchMock });
     const module = new HistoryModule();
     settings.configure({ maxHistorySize: 1 });
 
-    const first = settings.context({ callerModules: [module] }, () => lm.call(undefined, [
+    const first = await settings.context({ callerModules: [module] }, () => lm.acall(undefined, [
       { role: 'user', content: 'say hello' },
     ]));
-    const second = settings.context({ callerModules: [module] }, () => lm.call(undefined, [
+    const second = await settings.context({ callerModules: [module] }, () => lm.acall(undefined, [
       { role: 'user', content: 'say world' },
     ], {
       temperature: 0.3,
@@ -112,60 +120,67 @@ describe('LM', () => {
     expect(getGlobalHistory()).toHaveLength(2);
     expect(lm.history[0]?.kwargs.temperature).toBe(0.3);
 
-    const [, args] = vi.mocked(execFileSync).mock.calls[0]!;
-    expect(args).toContain('https://api.openai.com/v1/chat/completions');
+    const [url] = fetchMock.mock.calls[0] as [string, unknown];
+    expect(url).toBe('https://api.openai.com/v1/chat/completions');
   });
 
-  it('normalizes missing or null chat completion content to empty text', () => {
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce(`${JSON.stringify({
-        model: 'gpt-4.1-mini',
-        choices: [
-          {
-            message: {},
-            finish_reason: 'stop',
-          },
-        ],
-        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
-      })}\n200`)
-      .mockReturnValueOnce(`${JSON.stringify({
-        model: 'gpt-4.1-mini',
-        choices: [
-          {
-            message: { content: null },
-            finish_reason: 'stop',
-          },
-        ],
-        usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
-      })}\n200`);
-
-    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test' });
-
-    expect(lm.call(undefined, [{ role: 'user', content: 'first' }])).toEqual(['']);
-    expect(lm.call(undefined, [{ role: 'user', content: 'second' }])).toEqual(['']);
-  });
-
-  it('records reasoning token usage from nested completion token details', () => {
-    vi.mocked(execFileSync).mockReturnValueOnce(`${JSON.stringify({
-      model: 'gpt-4.1-mini',
-      choices: [
-        {
-          message: { content: 'hello' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: {
-        prompt_tokens: 2,
-        completion_tokens: 5,
-        total_tokens: 7,
-        completion_tokens_details: {
-          reasoning_tokens: 3,
+  it('normalizes missing or null chat completion content to empty text', async () => {
+    const fetchMock = mockFetch(
+      {
+        body: {
+          model: 'gpt-4.1-mini',
+          choices: [
+            {
+              message: {},
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
         },
       },
-    })}\n200`);
+      {
+        body: {
+          model: 'gpt-4.1-mini',
+          choices: [
+            {
+              message: { content: null },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+        },
+      },
+    );
 
-    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test' });
-    lm.call(undefined, [{ role: 'user', content: 'track usage' }]);
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', fetch: fetchMock });
+
+    expect(await lm.acall(undefined, [{ role: 'user', content: 'first' }])).toEqual(['']);
+    expect(await lm.acall(undefined, [{ role: 'user', content: 'second' }])).toEqual(['']);
+  });
+
+  it('records reasoning token usage from nested completion token details', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'gpt-4.1-mini',
+        choices: [
+          {
+            message: { content: 'hello' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 2,
+          completion_tokens: 5,
+          total_tokens: 7,
+          completion_tokens_details: {
+            reasoning_tokens: 3,
+          },
+        },
+      },
+    });
+
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', fetch: fetchMock });
+    await lm.acall(undefined, [{ role: 'user', content: 'track usage' }]);
 
     expect(lm.history[0]?.usage.reasoning_tokens).toBe(3);
   });
@@ -231,37 +246,47 @@ describe('LM', () => {
     expect(body.max_output_tokens).toBe(32);
   });
 
-  it('maps context-window failures to ContextWindowExceededError', () => {
-    vi.mocked(execFileSync).mockImplementation(() => {
-      throw new Error('maximum context length exceeded');
+  it('maps context-window failures to ContextWindowExceededError', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () => JSON.stringify({
+        error: {
+          message: 'maximum context length exceeded',
+          code: 'context_length_exceeded',
+        },
+      }),
     });
 
-    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', numRetries: 0 });
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', numRetries: 0, fetch: fetchMock });
 
-    expect(() => lm.call(undefined, [{ role: 'user', content: 'too long' } as Message])).toThrow(
+    await expect(lm.acall(undefined, [{ role: 'user', content: 'too long' } as Message])).rejects.toThrow(
       ContextWindowExceededError,
     );
   });
 
-  it('defaults OpenRouter Minimax calls to hidden reasoning without forcing effort', () => {
-    vi.mocked(execFileSync).mockReturnValueOnce(`${JSON.stringify({
-      model: 'minimax/minimax-m2.7',
-      choices: [
-        {
-          message: { content: '{"answer":"The Port City"}' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-    })}\n200`);
+  it('defaults OpenRouter Minimax calls to hidden reasoning without forcing effort', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'minimax/minimax-m2.7',
+        choices: [
+          {
+            message: { content: '{"answer":"The Port City"}' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      },
+    });
 
     const lm = new LM('openrouter/minimax/minimax-m2.7', {
       apiKey: 'sk-test',
+      fetch: fetchMock,
     });
 
-    lm.call(undefined, [{ role: 'user', content: 'Answer as JSON.' }], { max_tokens: 2048 });
+    await lm.acall(undefined, [{ role: 'user', content: 'Answer as JSON.' }], { max_tokens: 2048 });
 
-    const body = requestBodyFromExecFileSyncCall(0);
+    const body = requestBodyFromFetchCall(fetchMock, 0);
     expect(body.model).toBe('minimax/minimax-m2.7');
     expect(body.max_tokens).toBe(4096);
     expect(body.reasoning).toEqual({
@@ -269,23 +294,26 @@ describe('LM', () => {
     });
   });
 
-  it('flattens extra_body and preserves explicit Minimax reasoning overrides', () => {
-    vi.mocked(execFileSync).mockReturnValueOnce(`${JSON.stringify({
-      model: 'minimax/minimax-m2.7',
-      choices: [
-        {
-          message: { content: '{"answer":"The Port City"}' },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-    })}\n200`);
+  it('flattens extra_body and preserves explicit Minimax reasoning overrides', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'minimax/minimax-m2.7',
+        choices: [
+          {
+            message: { content: '{"answer":"The Port City"}' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      },
+    });
 
     const lm = new LM('openrouter/minimax/minimax-m2.7', {
       apiKey: 'sk-test',
+      fetch: fetchMock,
     });
 
-    lm.call(undefined, [{ role: 'user', content: 'Answer as JSON.' }], {
+    await lm.acall(undefined, [{ role: 'user', content: 'Answer as JSON.' }], {
       max_tokens: 2048,
       extra_body: {
         reasoning: {
@@ -298,7 +326,7 @@ describe('LM', () => {
       },
     });
 
-    const body = requestBodyFromExecFileSyncCall(0);
+    const body = requestBodyFromFetchCall(fetchMock, 0);
     expect(body.extra_body).toBeUndefined();
     expect(body.max_tokens).toBe(4096);
     expect(body.reasoning).toEqual({
