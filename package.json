@@ -7,8 +7,9 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
     }
   },
   "files": [
@@ -22,14 +23,19 @@
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "deps:circular": "madge --circular --extensions ts --ts-config tsconfig.typecheck.json src",
     "deps:rlm-legacy": "node tools/deps_rlm_legacy.mjs",
+    "deps:rlm-legacy:strict": "node tools/deps_rlm_legacy.mjs --strict",
     "knip": "knip",
     "pack:dry-run": "pnpm pack --dry-run",
     "release:gate": "uv run ../benchmarks/release_gate.py",
-    "bench:minimax-policy": "npx tsx tests/minimax_policy_benchmark.ts"
+    "bench:minimax-policy": "npx tsx tests/minimax_policy_benchmark.ts",
+    "bench:rlm-v2": "npx tsx tools/record_rlm_v2.ts --verify",
+    "record:rlm-v2": "npx tsx tools/record_rlm_v2.ts",
+    "smoke:consumer": "bash tools/consumer_smoke.sh"
   },
   "devDependencies": {
     "@ax-llm/ax": "^19.0.41",
     "@types/node": "^25.5.2",
+    "fast-check": "^4.7.0",
     "knip": "^6.4.1",
     "madge": "^8.0.0",
     "typescript": "^5.8.0",

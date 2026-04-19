@@ -13,6 +13,12 @@ import type {
   PredictorTrace,
   ReflectiveDatum,
 } from './gepa_types.js';
+import type { JsonValue } from './json_value.js';
+
+function metricFeedbackFromUnknown(value: unknown): JsonValue | null {
+  if (value === null || value === undefined) return null;
+  return value as JsonValue;
+}
 
 function stableTokenId(token: string): number {
   let hash = 0;
@@ -77,13 +83,14 @@ export function normalizeMetricRecord(
 
   if (value instanceof Prediction) {
     let score: number | null = null;
-    try {
-      score = value.toFloat();
-    } catch {
-      score = null;
+    if (value.has('score')) {
+      const raw = Number(value.get('score'));
+      score = Number.isFinite(raw) ? raw : null;
     }
 
-    const feedback = value.has('feedback') ? value.get('feedback') : null;
+    const feedback = value.has('feedback')
+      ? metricFeedbackFromUnknown(value.get('feedback'))
+      : null;
     const subscores = value.has('subscores')
       ? normalizeSubscores(value.get('subscores'))
       : Object.freeze([]);
@@ -108,7 +115,7 @@ export function normalizeMetricRecord(
     return Object.freeze({
       score: numericScore ?? (failed ? failureScore : null),
       subscores: normalizeSubscores(value.subscores),
-      feedback: value.feedback ?? null,
+      feedback: metricFeedbackFromUnknown(value.feedback),
       failed,
     });
   }
@@ -138,7 +145,16 @@ export function capturePredictorTraces(
   rows: readonly EvaluationRow[],
   options: {
     readonly failureScore?: number;
-    readonly histories?: Readonly<Record<number, unknown>>;
+    /**
+     * Optional per-example execution trace. Keyed by row index; each
+     * value is forwarded to every target's `PredictorTrace.executionTrace`
+     * verbatim. GEPA is agnostic about the shape beyond
+     * `EvaluationTrace`'s structural contract — RLM v2 passes its
+     * `EvaluationContext.trace` here directly.
+     */
+    readonly executionTraces?: Readonly<
+      Record<number, PredictorTrace['executionTrace']>
+    >;
   } = {},
 ): readonly PredictorTrace[] {
   const targets = projectPredictorTargets(program);
@@ -150,7 +166,7 @@ export function capturePredictorTraces(
     const exampleInput = example.inputs().toDict();
     const predictionOutput = prediction.toDict();
     const metric = normalizeMetricRecord(score, failureScore);
-    const history = (options.histories?.[exampleId] ?? null) as PredictorTrace['history'];
+    const executionTrace = options.executionTraces?.[exampleId] ?? null;
 
     for (const target of targets) {
       traces.push(Object.freeze({
@@ -159,7 +175,7 @@ export function capturePredictorTraces(
         input: exampleInput,
         output: predictionOutput,
         metric,
-        history,
+        executionTrace,
       }));
     }
   }

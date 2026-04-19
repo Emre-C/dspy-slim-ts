@@ -8,7 +8,7 @@
  * `ensemble` — which requires that every node be structurally inspectable.
  *
  * See:
- * - `docs/RLM_V2_IMPLEMENTATION_PLAN.md §2.1` (canonical shape)
+ * - `docs/product/rlm-v2-architecture.md` §2.1 (canonical shape)
  * - `spec/abstractions.md §0.5` (typed combinator runtime clause)
  *
  * A plan is JSON-serializable. Deserialized plans round-trip identically
@@ -18,6 +18,8 @@
  * This module is evaluator-agnostic: it defines shapes and typed
  * constructors only. The walker lives in `src/rlm_evaluator.ts`.
  */
+
+import type { JsonObject } from './json_value.js';
 
 // ---------------------------------------------------------------------------
 // Value domain
@@ -34,7 +36,7 @@ export type CombinatorValue =
   | number
   | boolean
   | CombinatorList
-  | Record<string, unknown>;
+  | JsonObject;
 
 export type CombinatorList = readonly CombinatorValue[];
 
@@ -47,9 +49,7 @@ export type CombinatorList = readonly CombinatorValue[];
  *
  * Deterministic leaves (`literal`, `var`) and deterministic internal nodes
  * (`split`, `peek`, `map`, `filter`, `reduce`, `concat`, `cross`) execute
- * without the LLM. Neural leaves (`oracle`) and neural fan-outs (`vote`,
- * `ensemble`) invoke an LLM via `Predict`; those branches land in Phase 2
- * and throw `RuntimeError` at Phase 1.
+ * without the LLM. Neural nodes (`oracle`, `vote`, `ensemble`) call `Predict`.
  */
 export type CombinatorNode =
   | { readonly tag: 'literal'; readonly value: CombinatorValue }

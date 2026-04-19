@@ -1,65 +1,73 @@
 /**
  * RLM v2 combinator evaluator.
  *
- * Walks a `CombinatorNode` AST and reduces it to a `CombinatorValue`. Every
- * recursive call pushes an `EvaluationTrace` entry after the node's inner
- * evaluation completes (success or failure). `Map`, `Filter`, `Vote`, and
- * `Ensemble` parallelize fan-out via a bounded worker pool capped by
- * `budget.maxParallelism`. `Reduce` is strictly sequential.
+ * Walks a `CombinatorNode` AST to a `CombinatorValue`, appending
+ * `EvaluationTrace` after each node. `Map` / `Filter` / `Vote` / `Ensemble`
+ * fan out under `budget.maxParallelism`; `Reduce` is sequential. Neural nodes
+ * (`oracle`, `vote`, `ensemble`) call `Predict.acall`; each oracle slot
+ * increments `ctx.callsUsed` before the LM call and throws `BudgetError` past
+ * `maxOracleCalls`.
  *
- * Phase 1 covered the deterministic subset: `literal`, `var`, `split`,
- * `peek`, `map`, `filter`, `reduce`, `concat`, `cross`.
- *
- * Phase 2 wires the three neural nodes — `oracle`, `vote`, `ensemble` —
- * through `Predict.acall()`. Every oracle invocation (direct `oracle` leaf,
- * each lane inside `vote`, each model inside `ensemble`, and each
- * `verifier`-style reducer probe) consumes one slot from
- * `ctx.budget.maxOracleCalls`. The budget is enforced strictly: the
- * counter is incremented before the network call and `BudgetError` is
- * thrown if the increment would exceed the ceiling.
- *
- * See `docs/RLM_V2_IMPLEMENTATION_PLAN.md §4 phase 2` and `spec/abstractions.md
- * §0.5` for the contract this file implements.
+ * Contract: `docs/product/rlm-v2-architecture.md` §4.1 and `spec/abstractions.md §0.5`.
  */
 
 import type { BaseLM } from './lm.js';
 import { Predict } from './predict.js';
 import type { Prediction } from './prediction.js';
-import { type Signature, signatureFromString } from './signature.js';
+import {
+  type Signature,
+  signatureFromString,
+  withInstructions,
+} from './signature.js';
 import { BudgetError, RuntimeError, ValueError } from './exceptions.js';
 import type {
   CombinatorBinary,
-  CombinatorFn,
   CombinatorNode,
   CombinatorValue,
   EnsembleReducer,
   VoteReducer,
 } from './rlm_combinators.js';
 import type {
+  BuildEvaluationContextOptions,
   EffectHandler,
   EvaluationContext,
   EvaluationTrace,
-  RLMBudget,
-  TypedMemoryState,
 } from './rlm_types.js';
-import { DEFAULT_BUDGET } from './rlm_types.js';
+import { mergeBudget } from './rlm_types.js';
+import {
+  EMPTY_TYPED_MEMORY_STATE,
+  defaultMemoryInjector,
+  type TypedMemoryState,
+} from './rlm_memory.js';
+import {
+  EFFECT_ORACLE_SIGNATURE,
+  appendEffectResult,
+  builtInEffectHandlers,
+  parseOracleResponse,
+  type Effect,
+  type EffectResult,
+  type OracleResponse,
+} from './rlm_effects.js';
+import { typeName } from './rlm_util.js';
 
 // ---------------------------------------------------------------------------
 // Oracle signatures — module-scoped, built once.
 // ---------------------------------------------------------------------------
 //
-// These three signatures are the full surface that the combinator runtime
-// asks of any wrapped `BaseLM`. Keeping them at module scope avoids the
+// These module-scoped signatures (plus `EFFECT_ORACLE_SIGNATURE` in
+// `rlm_effects.ts`) are the surfaces the combinator runtime asks of any
+// wrapped `BaseLM`. Keeping them at module scope avoids the
 // overhead of parsing the signature string on every oracle invocation while
 // still letting the adapter pipeline do all the real JSON coercion.
 //
-// * `ORACLE_SIGNATURE` — the canonical leaf. Every direct `oracle` call and
-//   every `vote` lane goes through this shape.
+// * `ORACLE_SIGNATURE` — plain `prompt -> answer` pipe for `vote` lanes,
+//   `ensemble` (non-verifier), and `QueryOracle` delegation. Direct
+//   `oracle` combinator leaves use `EFFECT_ORACLE_SIGNATURE` via the
+//   effect loop (`callOracleLeafWithEffects`).
 // * `CONFIDENCE_ORACLE_SIGNATURE` — used by `ensemble` with the
 //   `confidence` reducer so each model can self-report a weighting signal.
-// * `VERIFIER_SIGNATURE` — used by both `vote` and `ensemble` when the
-//   `verifier` reducer is selected; each candidate answer is cross-checked
-//   by the same LM pool and the first positively-verdicted candidate wins.
+// * `RLM_VERIFIER_SIGNATURE` — verifier probes for `vote` / `ensemble`
+//   `verifier` reducers and for beam-route candidate selection in `RLM`.
 
 const ORACLE_SIGNATURE: Signature = signatureFromString(
   'prompt: str -> answer: str',
@@ -69,7 +77,8 @@ const CONFIDENCE_ORACLE_SIGNATURE: Signature = signatureFromString(
   'prompt: str -> answer: str, confidence: float',
 );
 
-const VERIFIER_SIGNATURE: Signature = signatureFromString(
+/** Shared with `RLM` beam verification — single parse site for this shape. */
+export const RLM_VERIFIER_SIGNATURE: Signature = signatureFromString(
   'prompt: str, candidate: str -> verdict: bool',
 );
 
@@ -77,34 +86,24 @@ const VERIFIER_SIGNATURE: Signature = signatureFromString(
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Options accepted by `buildEvaluationContext`. The helper normalizes
- * `RLMOptions` input into a fully-populated `EvaluationContext` suitable
- * for `evaluate()`.
- *
- * Phase 1 surface: `lm` and `signature` are required; everything else
- * defaults. Phase 2 extends the options with `lmRegistry` wiring from the
- * `RLM` constructor; Phase 6 extends with `handlers`; Phase 7 extends with
- * `memory`.
- */
-export interface BuildEvaluationContextOptions {
-  readonly lm: BaseLM;
-  readonly signature: Signature;
-  readonly budget?: Partial<RLMBudget>;
-  readonly lmRegistry?: ReadonlyMap<string, BaseLM>;
-  readonly scope?: ReadonlyMap<string, CombinatorValue>;
-  readonly handlers?: ReadonlyMap<string, EffectHandler>;
-  readonly memory?: TypedMemoryState;
-}
+export type { BuildEvaluationContextOptions } from './rlm_types.js';
 
 /**
  * Build a fresh `EvaluationContext` with all fields populated. The `trace`
  * and `callsUsed` objects are freshly created so a single builder does not
  * share mutable state across independent `aforward` invocations.
+ *
+ * The returned context has the four built-in effect handlers
+ * (`ReadContext`, `WriteMemory`, `QueryOracle`, `Yield`) pre-registered;
+ * any user-supplied handlers with matching names override the defaults.
+ * User handlers with fresh names (including custom ones dispatched via
+ * `Effect.kind === 'Custom'`) are merged alongside.
  */
 export function buildEvaluationContext(
   options: BuildEvaluationContextOptions,
 ): EvaluationContext {
+  const initialMemory: TypedMemoryState =
+    options.memory ?? EMPTY_TYPED_MEMORY_STATE;
   return {
     budget: mergeBudget(options.budget),
     lm: options.lm,
@@ -114,10 +113,36 @@ export function buildEvaluationContext(
     depth: 0,
     callsUsed: { current: 0 },
     trace: [],
-    handlers: options.handlers ?? new Map<string, EffectHandler>(),
-    memory: options.memory ?? new Map<string, unknown>(),
+    handlers: buildHandlerRegistry(options.handlers),
+    memoryCell: { current: initialMemory },
+    memorySchema: options.memorySchema ?? null,
   };
 }
+
+/**
+ * Assemble the final handler registry: start from the built-in set,
+ * then overlay any user-provided entries. Users always win on name
+ * collisions — the defaults exist to give a useful runtime when no
+ * handlers are supplied, not to block overrides.
+ *
+ * The `QueryOracle` default uses the plain oracle helper so nested
+ * oracle calls never recursively enter another effect loop.
+ */
+function buildHandlerRegistry(
+  userHandlers: ReadonlyMap<string, EffectHandler> | undefined,
+): ReadonlyMap<string, EffectHandler> {
+  const out = new Map<string, EffectHandler>();
+  for (const handler of builtInEffectHandlers(callOracleLeafPlain)) {
+    out.set(handler.name, handler);
+  }
+  if (userHandlers !== undefined) {
+    for (const [name, handler] of userHandlers) {
+      out.set(name, handler);
+    }
+  }
+  return out;
+}
+
 
 /**
  * Evaluate a combinator plan under a context.
@@ -147,6 +172,7 @@ export async function evaluate(
     pushTrace(ctx, node, startedAt, startNs, true);
     return value;
   } catch (cause) {
+    // Record the failed node in the shared trace, then rethrow unchanged.
     pushTrace(ctx, node, startedAt, startNs, false, cause);
     throw cause;
   }
@@ -301,7 +327,7 @@ async function evaluateInner(
       const answers = await runBounded(
         indices,
         ctx.budget.maxParallelism,
-        async () => callOracleLeaf(prompt, modelHint, ctx),
+        async () => callOracleLeafPlain(prompt, modelHint, ctx),
       );
       return reduceVote(answers, reducer, prompt, modelHint, ctx);
     }
@@ -335,7 +361,7 @@ async function evaluateInner(
     case 'oracle': {
       const promptValue = await evaluate(node.prompt, ctx);
       const prompt = requireString(promptValue, 'oracle prompt');
-      return callOracleLeaf(prompt, node.modelHint, ctx);
+      return callOracleLeafWithEffects(prompt, node.modelHint, ctx);
     }
 
     default: {
@@ -389,12 +415,9 @@ async function reduceSequential(
 // `modelHint -> lmRegistry -> ctx.lm` fallback is applied.
 
 /**
- * Resolve a model hint against the registry, falling back to the default
- * `ctx.lm` when the hint is absent or unknown. Phase 2 chooses a *silent
- * fallback* over a hard error because ensemble / routing plans emitted by
- * earlier optimizers may legitimately reference models that a downstream
- * deployment has not wired; the alternative (fail-fast) is easy to recover
- * via Phase 5's registry construction helpers.
+ * Resolve a model hint against the registry, falling back to `ctx.lm` when
+ * absent or unknown (silent fallback so plans can name hints not wired in a
+ * given deployment).
  */
 function resolveOracleLm(
   modelHint: string | undefined,
@@ -411,6 +434,10 @@ function resolveOracleLm(
  * and awaits the async call. A fresh `Predict` per invocation is cheap
  * (sub-microsecond) and keeps the predictor stateless — we never want a
  * cross-call demo or trace accumulation to leak between oracle sites.
+ *
+ * When `ctx.memorySchema` is set, augments the signature instructions with
+ * the memory banner each call so `WriteMemory` updates visible on the next
+ * oracle turn.
  */
 async function invokePredict(
   signature: Signature,
@@ -425,15 +452,48 @@ async function invokePredict(
     );
   }
   const lm = resolveOracleLm(modelHint, ctx);
-  const predictor = new Predict(signature);
+  const effectiveSignature = injectMemoryBanner(signature, ctx);
+  const predictor = new Predict(effectiveSignature);
   return predictor.acall({ ...kwargs, lm });
 }
 
 /**
- * Shape-checked oracle call that returns the `answer` field as a string.
- * Used by the direct `oracle` branch and by every `vote` lane.
+ * Append the rendered memory banner to the signature's instructions
+ * when the plan declares a schema. Returns the input signature
+ * untouched when no schema is attached — plans without memory pay no
+ * per-call overhead beyond a single null check.
+ *
+ * The banner is placed after the existing instructions with a blank
+ * line separator so the adapter's `formatTaskDescription` renders it
+ * as a distinct block at the end of the system message. The LM's
+ * natural reading order — objective, then context — is preserved.
  */
-async function callOracleLeaf(
+function injectMemoryBanner(
+  signature: Signature,
+  ctx: EvaluationContext,
+): Signature {
+  const schema = ctx.memorySchema;
+  if (schema === null) return signature;
+  const banner = defaultMemoryInjector.render(schema, ctx.memoryCell.current);
+  if (banner === '') return signature;
+  const base = signature.instructions.trim();
+  const instructions = base === '' ? banner : `${base}\n\n${banner}`;
+  return withInstructions(signature, instructions);
+}
+
+/**
+ * Shape-checked plain-oracle call that returns the `answer` field as a
+ * string. Used by:
+ *
+ * - `vote`'s per-lane sampling where the wrapper semantics of the
+ *   effect loop would muddy the self-consistency signal.
+ * - `QueryOracle` (as `callOracleFn`) since by definition that effect
+ *   is a flat single-call delegation that must not recurse.
+ *
+ * All paths that want the full effect-loop behavior go through
+ * `callOracleLeafWithEffects` below.
+ */
+async function callOracleLeafPlain(
   prompt: string,
   modelHint: string | undefined,
   ctx: EvaluationContext,
@@ -451,6 +511,164 @@ async function callOracleLeaf(
     );
   }
   return answer;
+}
+
+/**
+ * Drive the oracle effect loop.
+ *
+ * Each iteration:
+ *
+ * 1. Calls the LM with `EFFECT_ORACLE_SIGNATURE` and the current
+ *    (possibly effect-augmented) prompt.
+ * 2. Parses the prediction into an `OracleResponse`.
+ *    - `kind: 'value'` — returns to the caller; nothing else traced.
+ *    - `kind: 'effect'` — dispatches through the handler registry,
+ *      appends the result to the prompt, and continues.
+ * 3. Malformed effects or unknown handlers surface as
+ *    `{ ok: false, error }` blocks appended to the prompt; the LM
+ *    sees them next turn and can retry. Parse errors use the same
+ *    channel.
+ * 4. Handler exceptions propagate as `EffectResult` errors unless
+ *    they are `BudgetError` — budget enforcement is non-recoverable
+ *    by design.
+ *
+ * If the loop runs all `ctx.budget.maxEffectTurns` iterations without
+ * a `value` response, a `BudgetError` is thrown. The partial trace
+ * remains in `ctx.trace` for post-mortem inspection.
+ *
+ * Every effect-dispatch turn pushes a single `EvaluationTrace` entry
+ * tagged `'effect'` with `extras = { turn, effectKind, handlerOk }`.
+ * Value turns do not add an entry; the surrounding combinator node's
+ * trace entry already reflects the successful leaf.
+ */
+async function callOracleLeafWithEffects(
+  initialPrompt: string,
+  modelHint: string | undefined,
+  ctx: EvaluationContext,
+): Promise<string> {
+  const maxTurns = ctx.budget.maxEffectTurns;
+  let prompt = initialPrompt;
+  for (let turn = 0; turn < maxTurns; turn += 1) {
+    const prediction = await invokePredict(
+      EFFECT_ORACLE_SIGNATURE,
+      { prompt },
+      modelHint,
+      ctx,
+    );
+    let response: OracleResponse;
+    try {
+      response = parseOracleResponse(prediction);
+    } catch (err) {
+      // LM output boundary: malformed oracle text becomes feedback for the next effect turn.
+      const message = err instanceof Error ? err.message : String(err);
+      prompt = appendRawError(prompt, message, turn);
+      pushEffectTrace(ctx, turn, 'parse_error', false);
+      continue;
+    }
+    if (response.kind === 'value') {
+      return response.value;
+    }
+    const effect = response.effect;
+    const handler = resolveEffectHandler(effect, ctx);
+    const startedAt = new Date().toISOString();
+    const startNs = performance.now();
+    let result: EffectResult;
+    if (handler === null) {
+      result = {
+        ok: false,
+        error: `No handler registered for effect kind "${effect.kind}"${
+          effect.kind === 'Custom' ? ` (name="${effect.name}")` : ''
+        }`,
+      };
+    } else {
+      try {
+        result = await handler.handle(effect, ctx);
+      } catch (err) {
+        // Third-party handler boundary: never let handler throws abort the effect loop (budget still fatal).
+        if (err instanceof BudgetError) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        result = {
+          ok: false,
+          error: `Handler "${handler.name}" threw: ${message}`,
+        };
+      }
+    }
+    pushEffectTrace(
+      ctx,
+      turn,
+      effect.kind,
+      result.ok,
+      startedAt,
+      startNs,
+      handler?.name,
+    );
+    prompt = appendEffectResult(prompt, effect, result, turn);
+  }
+  throw new BudgetError(
+    `RLM oracle exceeded maxEffectTurns=${maxTurns}`,
+  );
+}
+
+/**
+ * Resolve an effect to its handler. Custom effects look up by their
+ * `name` first, then fall back to any user handler named `'Custom'`.
+ * Non-custom effects look up strictly by `kind`.
+ */
+function resolveEffectHandler(
+  effect: Effect,
+  ctx: EvaluationContext,
+): EffectHandler | null {
+  if (effect.kind === 'Custom') {
+    return (
+      ctx.handlers.get(effect.name) ?? ctx.handlers.get('Custom') ?? null
+    );
+  }
+  return ctx.handlers.get(effect.kind) ?? null;
+}
+
+function pushEffectTrace(
+  ctx: EvaluationContext,
+  turn: number,
+  effectKind: string,
+  ok: boolean,
+  startedAt?: string,
+  startNs?: number,
+  handlerName?: string,
+): void {
+  const now = performance.now();
+  const entry: EvaluationTrace = {
+    step: ctx.trace.length,
+    nodeTag: 'effect',
+    startedAt: startedAt ?? new Date().toISOString(),
+    durationMs: startNs === undefined ? 0 : now - startNs,
+    ok,
+    extras: Object.freeze({
+      turn,
+      effectKind,
+      ...(handlerName !== undefined ? { handlerName } : {}),
+    }),
+  };
+  ctx.trace.push(entry);
+}
+
+/**
+ * Append a parse-error block to the next-turn prompt. Parse errors do
+ * not carry an `effect` payload by definition, so `appendEffectResult`
+ * is not reusable. The format mirrors the structured effect block so
+ * downstream tooling can parse both with a single regex.
+ */
+function appendRawError(
+  prompt: string,
+  error: string,
+  turn: number,
+): string {
+  const block = [
+    `[[EFFECT turn=${turn} kind=parse_error]]`,
+    'args: {}',
+    `error: ${error}`,
+    '[[/EFFECT]]',
+  ].join('\n');
+  return prompt.length === 0 ? block : `${prompt}\n\n${block}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +771,7 @@ async function verifierSelect(
     ctx.budget.maxParallelism,
     async (candidate, index) => {
       const prediction = await invokePredict(
-        VERIFIER_SIGNATURE,
+        RLM_VERIFIER_SIGNATURE,
         { prompt, candidate },
         modelHint,
         ctx,
@@ -719,12 +937,6 @@ function requireList(value: CombinatorValue, what: string): ReadonlyArray<Combin
   return value as ReadonlyArray<CombinatorValue>;
 }
 
-function typeName(value: unknown): string {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return 'array';
-  return typeof value;
-}
-
 function keysOf(scope: ReadonlyMap<string, CombinatorValue>): string {
   const keys = [...scope.keys()];
   if (keys.length === 0) return '<empty scope>';
@@ -777,27 +989,3 @@ export const __internal = Object.freeze({
   modeOfStrings,
   resolveOracleLm,
 });
-
-// ---------------------------------------------------------------------------
-// Budget merge — declared at bottom so the `__internal` export above can
-// capture it. Kept here (rather than inline in `buildEvaluationContext`) so
-// callers who want the merged budget without a context — such as property
-// tests — can reach it via `__internal.mergeBudget`.
-// ---------------------------------------------------------------------------
-
-function mergeBudget(override?: Partial<RLMBudget>): RLMBudget {
-  if (override === undefined) return DEFAULT_BUDGET;
-  return {
-    maxOracleCalls: override.maxOracleCalls ?? DEFAULT_BUDGET.maxOracleCalls,
-    maxParallelism: override.maxParallelism ?? DEFAULT_BUDGET.maxParallelism,
-    maxDepth: override.maxDepth ?? DEFAULT_BUDGET.maxDepth,
-    leafThreshold: override.leafThreshold ?? DEFAULT_BUDGET.leafThreshold,
-    selfConsistencyN:
-      override.selfConsistencyN ?? DEFAULT_BUDGET.selfConsistencyN,
-    maxEffectTurns: override.maxEffectTurns ?? DEFAULT_BUDGET.maxEffectTurns,
-  };
-}
-
-// Used by a subset of `CombinatorFn` call sites in tests; re-exported as a
-// pure-type alias to keep consumers away from the internal shape.
-export type { CombinatorFn };

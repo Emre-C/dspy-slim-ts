@@ -1,549 +1,287 @@
 /**
- * Recursive Language Model (RLM) scaffold.
+ * Public RLM v2 facade.
+ *
+ * Thin wrapper over the typed combinator evaluator. `aforward(kwargs)`:
+ *
+ *   1. Resolves the primary `BaseLM` via `options.subLm ?? settings.lm`.
+ *   2. Builds a single `prompt` string from the inputs against the
+ *      signature.
+ *   3. Classifies the task (or honors `options.taskType`) to pick a
+ *      static plan; beam-routes on low confidence.
+ *   4. Resolves each candidate plan with the deterministic planner
+ *      (`k*`, `d`, `N`).
+ *   5. Runs the combinator evaluator over the resolved plan(s).
+ *   6. Wraps the result in a `Prediction` populated against the
+ *      caller's output signature.
+ *
+ * This file is intentionally small: every runtime decision lives in a
+ * dedicated module (`rlm_task_router`, `rlm_planner`, `rlm_evaluator`,
+ * `rlm_effects`, `rlm_memory`). The facade's job is to wire them
+ * together per the contract in
+ * `docs/product/rlm-v2-architecture.md` §2.6.
  */
 
-import { coerceFieldValue } from './codec.js';
-import { BudgetError, ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
-import { createField } from './field.js';
-import { isPlainObject } from './guards.js';
-import { BaseLM } from './lm.js';
+import { Adapter, JSONAdapter, type Message } from './adapter.js';
+import type { BaseLM } from './lm.js';
+import { BaseLM as BaseLMClass } from './lm.js';
+import {
+  BudgetError,
+  ConfigurationError,
+  RuntimeError,
+  ValueError,
+} from './exceptions.js';
 import { Module } from './module.js';
-import { createNodeCodeInterpreter, type SyncCodeInterpreter, type SyncCodeSession } from './node_code_interpreter.js';
 import { Prediction } from './prediction.js';
 import { Predict } from './predict.js';
 import { settings } from './settings.js';
-import { createSignature, ensureSignature, type Signature } from './signature.js';
+import { ensureSignature, type Signature } from './signature.js';
 import type { InferInputs, InferOutputs, SignatureInput } from './signature_types.js';
-import { Tool, type ToolInput } from './tool.js';
-import type {
-  BudgetVector,
-  CodeInterpreter,
-  CodeInterpreterError,
-  ExecuteResult,
-  REPLHistory,
-  REPLEntry,
-  REPLVariable,
-  RLMConfig,
+
+import type { CombinatorValue } from './rlm_combinators.js';
+import {
+  RLM_VERIFIER_SIGNATURE,
+  buildEvaluationContext,
+  evaluate,
+} from './rlm_evaluator.js';
+import {
+  EMPTY_TYPED_MEMORY_STATE,
+  initialMemoryState,
+  type MemorySchema,
+} from './rlm_memory.js';
+import {
+  mergeBudget,
+  type EffectHandler,
+  type EvaluationContext,
+  type EvaluationTrace,
+  type RLMBudget,
 } from './rlm_types.js';
+import { resolvePlan, type ResolvePlanArgs } from './rlm_planner.js';
+import {
+  DEFAULT_BEAM_TOP_K,
+  STATIC_PLANS,
+  classifyTask,
+  isTaskType,
+  resolveRoute,
+  type ClassifierResult,
+  type RouteResult,
+  type StaticPlan,
+  type TaskType,
+} from './rlm_task_router.js';
 
 const EMPTY_RECORD = Object.freeze({}) as Record<string, unknown>;
-const DEFAULT_MAX_ITERATIONS = 20;
-const DEFAULT_MAX_LLM_CALLS = 50;
-const DEFAULT_MAX_BATCH_WIDTH = 8;
-const DEFAULT_RESERVED_TOOL_NAMES = Object.freeze([
-  'llmQuery',
-  'llmQueryBatched',
-  'SUBMIT',
-  'print',
-]);
-const IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-
-interface NormalizedRLMTool {
-  readonly name: string;
-  readonly invoke: (...args: readonly unknown[]) => unknown;
-}
-
-export interface RLMOptions {
-  readonly budget?: Partial<BudgetVector>;
-  readonly trackTrace?: boolean;
-  readonly tools?: readonly ToolInput[];
-  readonly subLm?: BaseLM | null;
-  readonly interpreter?: CodeInterpreter<Record<string, unknown>, unknown>;
-  readonly reservedToolNames?: readonly string[];
-}
-
-function ensurePositiveInteger(name: string, value: unknown): number {
-  if (!Number.isInteger(value) || (value as number) < 1) {
-    throw new ValueError(`${name} must be a positive integer.`);
-  }
-  return value as number;
-}
-
-function buildBudgetVector(budget: Partial<BudgetVector> | undefined): BudgetVector {
-  return Object.freeze({
-    maxIterations: ensurePositiveInteger(
-      'RLM budget.maxIterations',
-      budget?.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-    ),
-    maxLlmCalls: ensurePositiveInteger(
-      'RLM budget.maxLlmCalls',
-      budget?.maxLlmCalls ?? DEFAULT_MAX_LLM_CALLS,
-    ),
-    maxBatchWidth: ensurePositiveInteger(
-      'RLM budget.maxBatchWidth',
-      budget?.maxBatchWidth ?? DEFAULT_MAX_BATCH_WIDTH,
-    ),
-  });
-}
-
-function stripCodeFences(source: string): string {
-  const trimmed = source.trim();
-  if (!trimmed.includes('```')) {
-    return trimmed;
-  }
-
-  const fenceMatch = trimmed.match(/^```(?:python|py|javascript|js|typescript|ts)?\s*\n([\s\S]*?)\n```$/i);
-  if (fenceMatch) {
-    return fenceMatch[1]!.trim();
-  }
-  return trimmed;
-}
-
-function formatVariables(variables: readonly REPLVariable[]): string {
-  if (variables.length === 0) {
-    return 'No variables are currently bound in the runtime session.';
-  }
-
-  return variables.map((variable) => {
-    const typeName = variable.value === null
-      ? 'null'
-      : Array.isArray(variable.value)
-        ? 'array'
-        : typeof variable.value;
-    return `${variable.symbol} (${typeName}, mutable=${String(variable.mutable)})`;
-  }).join('\n');
-}
-
-function formatHistory(history: REPLHistory): string {
-  if (history.entries.length === 0) {
-    return 'No interpreter steps have executed yet.';
-  }
-
-  return history.entries.map((entry) => (
-    `step=${entry.step} kind=${entry.kind} ok=${String(entry.ok)}`
-  )).join('\n');
-}
-
-function createActionSignature(maxLlmCalls: number) {
-  return createSignature(
-    new Map([
-      ['variables_info', createField({ kind: 'input', name: 'variables_info', typeTag: 'str', isTypeUndefined: false })],
-      ['repl_history', createField({ kind: 'input', name: 'repl_history', typeTag: 'str', isTypeUndefined: false })],
-      ['iteration', createField({ kind: 'input', name: 'iteration', typeTag: 'str', isTypeUndefined: false })],
-    ]),
-    new Map([
-      ['reasoning', createField({ kind: 'output', name: 'reasoning', typeTag: 'str', isTypeUndefined: false })],
-      ['code', createField({ kind: 'output', name: 'code', typeTag: 'str', isTypeUndefined: false })],
-    ]),
-    {
-      instructions: [
-        'You are controlling a persistent JavaScript REPL runtime.',
-        'Write JavaScript code in `code` that advances the task.',
-        `You may call llmQuery(prompt) or llmQueryBatched(prompts) up to ${maxLlmCalls} total sub-queries.`,
-        'When final outputs are ready, call SUBMIT({...}) with all required output fields.',
-      ].join('\n'),
-    },
-  );
-}
-
-function createExtractSignature(signature: ReturnType<typeof ensureSignature>) {
-  return createSignature(
-    new Map([
-      ['variables_info', createField({ kind: 'input', name: 'variables_info', typeTag: 'str', isTypeUndefined: false })],
-      ['repl_history', createField({ kind: 'input', name: 'repl_history', typeTag: 'str', isTypeUndefined: false })],
-    ]),
-    new Map(signature.outputFields),
-    {
-      instructions: [
-        signature.instructions,
-        'The runtime loop ended without SUBMIT.',
-        'Extract the final structured outputs from runtime state and history.',
-      ].join('\n\n'),
-    },
-  );
-}
-
-function normalizeTools(
-  tools: readonly ToolInput[],
-  reservedNames: ReadonlySet<string>,
-): ReadonlyMap<string, NormalizedRLMTool> {
-  const normalized = new Map<string, NormalizedRLMTool>();
-
-  for (const candidate of tools) {
-    const name = candidate.name;
-    if (name.trim() === '') {
-      throw new ValueError('RLM tools must have a non-empty function name.');
-    }
-    if (!IDENTIFIER_PATTERN.test(name)) {
-      throw new ValueError(`Invalid RLM tool name "${name}".`);
-    }
-    if (reservedNames.has(name)) {
-      throw new ValueError(`RLM tool name "${name}" is reserved by the runtime.`);
-    }
-    if (normalized.has(name)) {
-      throw new ValueError(`Duplicate RLM tool name "${name}".`);
-    }
-
-    const invoke = (...args: readonly unknown[]): unknown => {
-      const callable = candidate instanceof Tool ? candidate.func : candidate;
-      const result = Reflect.apply(callable as Function, undefined, args);
-      if (result instanceof Promise) {
-        throw new ValueError(`RLM tool "${name}" returned a Promise; async tools are not supported in sync runtime mode.`);
-      }
-      return result;
-    };
-
-    normalized.set(name, Object.freeze({ name, invoke }));
-  }
-
-  return normalized;
-}
-
-function lmOutputToText(output: unknown): string {
-  if (typeof output === 'string') {
-    return output;
-  }
-  if (
-    output
-    && typeof output === 'object'
-    && 'text' in output
-    && typeof (output as { readonly text?: unknown }).text === 'string'
-  ) {
-    return (output as { readonly text: string }).text;
-  }
-  return String(output ?? '');
-}
-
-function appendHistory(
-  history: REPLHistory,
-  delta: readonly REPLEntry[],
-  liveSymbols: readonly string[],
-): REPLHistory {
-  return Object.freeze({
-    entries: Object.freeze([...history.entries, ...delta]),
-    liveSymbols: Object.freeze([...liveSymbols]),
-  });
-}
 
 /**
- * Degraded fallback when inspectGlobals fails on a faulted session.
- * Reconstructs variable symbols from history but values are lost — the extract
- * LLM sees names and types only, not contents. This is intentionally lossy:
- * a faulted session cannot be inspected, and partial symbol info is more useful
- * to the extract predictor than an empty variable list.
+ * Constructor options for `RLM`.
+ *
+ * Every field is optional; defaults preserve the least-surprising
+ * behavior. See `docs/product/rlm-v2-architecture.md` §2.6 for the full
+ * intent of each knob.
  */
-function fallbackVariablesFromHistory(history: REPLHistory): readonly REPLVariable[] {
-  return Object.freeze(history.liveSymbols.map((symbol) => Object.freeze({
-    symbol,
-    value: null,
-    mutable: true,
-  })));
+export interface RLMOptions {
+  /**
+   * Partial override of the run-wide budget. Missing fields inherit
+   * `DEFAULT_BUDGET`. The evaluator enforces every field (see
+   * `BudgetError` handling in `src/rlm_evaluator.ts`).
+   */
+  readonly budget?: Partial<RLMBudget>;
+  /**
+   * Skip the classifier and use this task type directly. Useful when
+   * the caller already knows the task family or for deterministic
+   * tests. `'unknown'` is accepted; it routes to the `summarise`
+   * fallback plan.
+   */
+  readonly taskType?: TaskType;
+  /**
+   * Primary LM. Resolution order: `options.subLm ?? settings.lm`.
+   * `null` is treated identically to `undefined` — the RLM looks up
+   * `settings.lm`. Absent LMs throw `ConfigurationError` at call time.
+   */
+  readonly subLm?: BaseLM | null;
+  /**
+   * Named registry for `modelHint` routing inside the plan AST. E.g.
+   * the default static plans emit `oracle(..., 'gpt-fast')` and
+   * `oracle(..., 'gpt-deep')`; users bind those names to their own
+   * `BaseLM` instances via this map. The primary `subLm` is used when
+   * a `modelHint` is absent or unmatched.
+   */
+  readonly lmRegistry?: ReadonlyMap<string, BaseLM>;
+  /**
+   * Extra effect handlers, keyed by `handler.name`. Built-in handlers are
+   * always present; same-name entries here override them. Duplicate names in
+   * this list throw `ValueError` at construction.
+   */
+  readonly handlers?: readonly EffectHandler[];
+  /**
+   * User-supplied `StaticPlan`s. Each plan is indexed by its
+   * `taskType` and overrides the built-in registry entry for the same
+   * tag (if any). Plans without a matching tag add new dispatchable
+   * task types beyond the six defaults.
+   */
+  readonly plans?: readonly StaticPlan[];
+  /**
+   * When `true` (default), the returned `Prediction` includes a `trace`
+   * key holding the evaluator's `EvaluationTrace[]`. Set `false` to
+   * minimize prediction memory for high-volume runs.
+   */
+  readonly trackTrace?: boolean;
+  /**
+   * Threshold below which the router beam-routes. Mirrors
+   * `resolveRoute`'s default of 0.7. Power users can tune this per
+   * RLM instance.
+   */
+  readonly routeThreshold?: number;
+  /**
+   * Max number of plans included in a beam route. Mirrors the default
+   * of 2 from `resolveRoute`.
+   */
+  readonly routeBeamTopK?: number;
+  /**
+   * Injection point for tests: override the classifier. Default is
+   * `classifyTask` from `./rlm_task_router.ts`. Returns a
+   * `ClassifierResult` that the router dispatches on.
+   */
+  readonly classifier?: (
+    prompt: string,
+    signature: Signature,
+    lm: BaseLM,
+  ) => Promise<ClassifierResult>;
 }
 
-function isSyncInterpreter(
-  interpreter: CodeInterpreter<Record<string, unknown>, unknown>,
-): interpreter is SyncCodeInterpreter {
-  return typeof (interpreter as SyncCodeInterpreter).createSessionSync === 'function';
-}
+// ---------------------------------------------------------------------------
+// RLM class
+// ---------------------------------------------------------------------------
 
-function isSyncSession(session: unknown): session is SyncCodeSession {
-  return typeof (session as SyncCodeSession).executeSync === 'function'
-    && typeof (session as SyncCodeSession).inspectGlobalsSync === 'function';
-}
-
+/**
+ * RLM v2 public facade. Subclasses `Module` so it participates in
+ * `Evaluate`, `Parallel`, and callback machinery just like `Predict`
+ * does.
+ *
+ * Type parameters mirror `Predict<TSig, TInputs, TOutputs>`:
+ * `TInputs` / `TOutputs` are inferred from the signature so TypeScript
+ * callers get end-to-end typing of `aforward`'s kwargs and the
+ * returned `Prediction`'s output fields.
+ */
 export class RLM<
   TSig extends SignatureInput = Signature,
   TInputs extends Record<string, unknown> = InferInputs<TSig>,
   TOutputs extends Record<string, unknown> = InferOutputs<TSig>,
 > extends Module<TInputs, TOutputs> {
-  readonly signature: ReturnType<typeof ensureSignature>;
-  readonly config: RLMConfig;
-  readonly generateAction: Predict;
-  readonly extract: Predict;
-  readonly tools: ReadonlyMap<string, NormalizedRLMTool>;
-  readonly interpreter: CodeInterpreter<Record<string, unknown>, unknown>;
-
-  subLm: BaseLM | null;
+  readonly signature: Signature;
+  readonly budget: RLMBudget;
+  readonly trackTrace: boolean;
+  readonly taskTypeOverride: TaskType | null;
+  readonly subLm: BaseLM | null;
+  readonly lmRegistry: ReadonlyMap<string, BaseLM>;
+  readonly handlers: ReadonlyMap<string, EffectHandler>;
+  readonly plans: ReadonlyMap<TaskType, StaticPlan>;
+  readonly routeThreshold: number;
+  readonly routeBeamTopK: number;
+  readonly classifier: (
+    prompt: string,
+    signature: Signature,
+    lm: BaseLM,
+  ) => Promise<ClassifierResult>;
 
   constructor(signature: TSig, options: RLMOptions = {}) {
     super();
     this.signature = ensureSignature(signature);
-    const budget = buildBudgetVector(options.budget);
-    const reservedNames = new Set<string>([
-      ...DEFAULT_RESERVED_TOOL_NAMES,
-      ...(options.reservedToolNames ?? []),
-    ]);
-
-    this.config = Object.freeze({
-      budget,
-      trackTrace: options.trackTrace ?? true,
-      reservedToolNames: Object.freeze([...reservedNames]),
-      subLmResolution: 'instance_then_settings',
-    });
+    if (this.signature.outputFields.size === 0) {
+      throw new ValueError(
+        'RLM signature must declare at least one output field.',
+      );
+    }
+    if (options.taskType !== undefined && !isTaskType(options.taskType)) {
+      throw new ValueError(
+        `RLM options.taskType must be a valid TaskType, got ${String(options.taskType)}.`,
+      );
+    }
+    this.budget = mergeBudget(options.budget);
+    this.trackTrace = options.trackTrace ?? true;
+    this.taskTypeOverride = options.taskType ?? null;
     this.subLm = options.subLm ?? null;
-    this.tools = normalizeTools(options.tools ?? [], reservedNames);
-    this.interpreter = options.interpreter ?? createNodeCodeInterpreter();
-    this.generateAction = new Predict(createActionSignature(this.config.budget.maxLlmCalls));
-    this.extract = new Predict(createExtractSignature(this.signature));
-  }
-
-  override forward(kwargs: TInputs = EMPTY_RECORD as TInputs): Prediction<TOutputs> {
-    if (!isPlainObject(kwargs)) {
-      throw new ValueError('RLM expects a single plain-object argument.');
-    }
-    if (!isSyncInterpreter(this.interpreter)) {
-      throw new RuntimeError('RLM.forward requires a synchronous interpreter session.');
-    }
-
-    const session = this.interpreter.createSessionSync();
-    if (!isSyncSession(session)) {
-      throw new RuntimeError('RLM.forward requires a synchronous interpreter session implementation.');
-    }
-
-    return this.runWithSyncSession(session, kwargs as Record<string, unknown>);
-  }
-
-  override async aforward(kwargs: TInputs = EMPTY_RECORD as TInputs): Promise<Prediction<TOutputs>> {
-    if (!isPlainObject(kwargs)) {
-      throw new ValueError('RLM expects a single plain-object argument.');
-    }
-
-    const session = await this.interpreter.createSession();
-    return this.runWithAsyncSession(session, kwargs as Record<string, unknown>);
-  }
-
-  private createEmptyLoopState(): {
-    history: REPLHistory;
-    fault: CodeInterpreterError | null;
-    lastVariables: readonly REPLVariable[];
-  } {
-    return {
-      history: Object.freeze({ entries: Object.freeze([]), liveSymbols: Object.freeze([]) }),
-      fault: null,
-      lastVariables: Object.freeze([]),
-    };
-  }
-
-  private buildStepInputs(
-    variables: readonly REPLVariable[],
-    history: REPLHistory,
-    step: number,
-  ): Record<string, unknown> {
-    return {
-      variables_info: formatVariables(variables),
-      repl_history: formatHistory(history),
-      iteration: `${step}/${this.config.budget.maxIterations}`,
-    };
-  }
-
-  private processStepResult(
-    result: ExecuteResult<unknown>,
-    history: REPLHistory,
-    variables: readonly REPLVariable[],
-    fault: CodeInterpreterError | null,
-  ): {
-    history: REPLHistory;
-    fault: CodeInterpreterError | null;
-    prediction: Prediction<TOutputs> | null;
-    variables: readonly REPLVariable[];
-  } {
-    const symbols = variables.map((variable) => variable.symbol);
-    const updated = appendHistory(history, result.historyDelta, symbols);
-
-    if (result.tag === 'fault') {
-      return {
-        history: updated,
-        fault: result.error,
-        prediction: null,
-        variables,
-      };
-    }
-
-    if (result.tag === 'submit') {
-      return {
-        history: updated,
-        fault,
-        prediction: this.finalizePrediction(result, updated, fault),
-        variables,
-      };
-    }
-
-    return { history: updated, fault, prediction: null, variables };
-  }
-
-  private completeExtractFallback(
-    variables: readonly REPLVariable[],
-    extracted: Prediction,
-    history: REPLHistory,
-    fault: CodeInterpreterError | null,
-  ): Prediction<TOutputs> {
-    const outputs = this.normalizeExtractedOutput(extracted);
-    const historyWithExtract = appendHistory(
-      history,
-      Object.freeze([{ step: this.config.budget.maxIterations + 1, kind: 'extract' as const, ok: true }]),
-      variables.map((variable) => variable.symbol),
-    );
-    return this.finalizeExtractPrediction(outputs, historyWithExtract, fault);
-  }
-
-  private buildExtractInputs(
-    variables: readonly REPLVariable[],
-    history: REPLHistory,
-  ): Record<string, unknown> {
-    return {
-      variables_info: formatVariables(variables),
-      repl_history: formatHistory(history),
-    };
+    this.lmRegistry = options.lmRegistry ?? new Map<string, BaseLM>();
+    this.handlers = normalizeHandlers(options.handlers);
+    this.plans = mergePlans(options.plans);
+    this.routeThreshold = normalizeRouteThreshold(options.routeThreshold);
+    this.routeBeamTopK = normalizeRouteBeamTopK(options.routeBeamTopK);
+    this.classifier = options.classifier ?? classifyTask;
   }
 
   /**
-   * Sync vs async entrypoints share the same conceptual loop (`buildStepInputs`,
-   * `processStepResult`, extract fallback). Keep the two paths aligned so
-   * `forward` and `aforward` differ only in session I/O, not control flow.
+   * Synchronous invocation is unsupported — the evaluator is async
+   * because oracle leaves issue async LM calls. Throwing a loud error
+   * matches `LM`'s async-only posture (see `docs/product/rlm-v2-architecture.md`).
    */
-
-  // ── Sync path ───────────────────────────────────────────────────────
-
-  private runWithSyncSession(
-    session: SyncCodeSession,
-    kwargs: Record<string, unknown>,
-  ): Prediction<TOutputs> {
-    this.validateInputs(kwargs);
-    const state = this.createEmptyLoopState();
-
-    try {
-      session.patchGlobalsSync({ bindings: this.buildExecutionBindings(kwargs) });
-
-      for (let step = 1; step <= this.config.budget.maxIterations; step += 1) {
-        const variables = session.inspectGlobalsSync();
-        const action = this.generateAction.forward(this.buildStepInputs(variables, state.history, step));
-        const result = session.executeSync({
-          step, source: this.extractCode(action), budget: this.config.budget, allowSubmit: true,
-        });
-        const stepVariables = result.tag === 'fault'
-          ? result.liveVariables
-          : session.inspectGlobalsSync();
-        const outcome = this.processStepResult(result, state.history, stepVariables, state.fault);
-        state.history = outcome.history;
-        state.fault = outcome.fault;
-        state.lastVariables = outcome.variables;
-        if (outcome.prediction) return outcome.prediction;
-        if (outcome.fault) break;
-      }
-
-      let variables: readonly REPLVariable[];
-      try { variables = session.inspectGlobalsSync(); }
-      catch {
-        variables = state.lastVariables.length > 0
-          ? state.lastVariables
-          : fallbackVariablesFromHistory(state.history);
-      }
-      const extracted = this.extract.forward(this.buildExtractInputs(variables, state.history));
-      return this.completeExtractFallback(variables, extracted, state.history, state.fault);
-    } finally {
-      session.closeSync();
-    }
+  override forward(_kwargs: TInputs = EMPTY_RECORD as TInputs): never {
+    throw new RuntimeError(
+      'RLM is async-only. Use acall() or aforward() instead.',
+    );
   }
 
-  // ── Async path ──────────────────────────────────────────────────────
-
-  private async runWithAsyncSession(
-    session: {
-      readonly execute: SyncCodeSession['execute'];
-      readonly inspectGlobals: SyncCodeSession['inspectGlobals'];
-      readonly patchGlobals: SyncCodeSession['patchGlobals'];
-      readonly close: SyncCodeSession['close'];
-    },
-    kwargs: Record<string, unknown>,
+  override async aforward(
+    kwargs: TInputs = EMPTY_RECORD as TInputs,
   ): Promise<Prediction<TOutputs>> {
-    this.validateInputs(kwargs);
-    const state = this.createEmptyLoopState();
-
-    try {
-      await session.patchGlobals({ bindings: this.buildExecutionBindings(kwargs) });
-
-      for (let step = 1; step <= this.config.budget.maxIterations; step += 1) {
-        const variables = await session.inspectGlobals();
-        const action = await this.generateAction.acall(this.buildStepInputs(variables, state.history, step));
-        const result = await session.execute({
-          step, source: this.extractCode(action), budget: this.config.budget, allowSubmit: true,
-        });
-        const stepVariables = result.tag === 'fault'
-          ? result.liveVariables
-          : await session.inspectGlobals();
-        const outcome = this.processStepResult(result, state.history, stepVariables, state.fault);
-        state.history = outcome.history;
-        state.fault = outcome.fault;
-        state.lastVariables = outcome.variables;
-        if (outcome.prediction) return outcome.prediction;
-        if (outcome.fault) break;
-      }
-
-      let variables: readonly REPLVariable[];
-      try { variables = await session.inspectGlobals(); }
-      catch {
-        variables = state.lastVariables.length > 0
-          ? state.lastVariables
-          : fallbackVariablesFromHistory(state.history);
-      }
-      const extracted = await this.extract.acall(this.buildExtractInputs(variables, state.history));
-      return this.completeExtractFallback(variables, extracted, state.history, state.fault);
-    } finally {
-      await session.close();
-    }
+    const lm = this.resolvePrimaryLm();
+    const inputs = this.resolvePromptInputs(kwargs as Record<string, unknown>);
+    const prompt = this.buildPrompt(inputs);
+    const classifierResult = await this.resolveClassifierResult(prompt, lm);
+    const route = resolveRoute(classifierResult, {
+      threshold: this.routeThreshold,
+      beamTopK: this.routeBeamTopK,
+      plans: this.plans,
+    });
+    // A single shared ctx carries the budget counter, trace, and scope
+    // across plan execution so beam-routed runs bill against one
+    // budget. Memory is plan-scoped (each plan may declare a different
+    // schema) and gets attached per-plan inside `runPlan` via a
+    // cloned context.
+    const ctx = buildEvaluationContext({
+      lm,
+      signature: this.signature,
+      budget: this.budget,
+      lmRegistry: this.lmRegistry,
+      handlers: this.handlers,
+      scope: new Map<string, CombinatorValue>([['input', prompt]]),
+    });
+    const executed = await this.executeRoute(route, prompt, ctx);
+    return this.buildPrediction(executed, classifierResult, route, ctx);
   }
 
-  private validateInputs(kwargs: Record<string, unknown>): void {
-    const missing = [...this.signature.inputFields.keys()].filter((name) => !(name in kwargs));
+  // --------------------------------------------------------------------------
+  // Step 1: input validation
+  // --------------------------------------------------------------------------
+  private resolvePromptInputs(
+    kwargs: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const missing: string[] = [];
+    const inputs: Record<string, unknown> = {};
+    for (const name of this.signature.inputFields.keys()) {
+      if (name in kwargs) {
+        inputs[name] = kwargs[name];
+        continue;
+      }
+      const field = this.signature.inputFields.get(name);
+      if (field?.default !== undefined) {
+        inputs[name] = field.default;
+        continue;
+      }
+      missing.push(name);
+    }
     if (missing.length > 0) {
-      throw new ValueError(`Missing required RLM inputs: ${missing.join(', ')}`);
-    }
-  }
-
-  private buildExecutionBindings(kwargs: Record<string, unknown>): Record<string, unknown> {
-    const bindings: Record<string, unknown> = {
-      ...kwargs,
-      print: (...parts: readonly unknown[]) => {
-        console.log(...parts);
-      },
-      llmQuery: (prompt: string) => this.querySubLm(prompt),
-      llmQueryBatched: (prompts: readonly string[]) => this.querySubLmBatched(prompts),
-    };
-
-    for (const tool of this.tools.values()) {
-      bindings[tool.name] = (...args: readonly unknown[]) => tool.invoke(...args);
-    }
-
-    return bindings;
-  }
-
-  private querySubLm(prompt: string): string {
-    if (typeof prompt !== 'string' || prompt.trim() === '') {
-      throw new ValueError('llmQuery(prompt) requires a non-empty prompt string.');
-    }
-
-    const lm = this.resolveSubLm();
-    const outputs = lm.call(prompt);
-    const first = outputs[0];
-    return lmOutputToText(first);
-  }
-
-  private querySubLmBatched(prompts: readonly string[]): readonly string[] {
-    if (!Array.isArray(prompts)) {
-      throw new ValueError('llmQueryBatched(prompts) expects an array of strings.');
-    }
-    if (prompts.length > this.config.budget.maxBatchWidth) {
-      throw new BudgetError(
-        `llmQueryBatched batch width exceeded (${prompts.length} > ${this.config.budget.maxBatchWidth}).`,
+      throw new ValueError(
+        `RLM is missing required inputs: ${missing.join(', ')}`,
       );
     }
-
-    const results: string[] = [];
-    for (const [index, prompt] of prompts.entries()) {
-      try {
-        results.push(this.querySubLm(prompt));
-      } catch (error) {
-        throw new RuntimeError(
-          `llmQueryBatched aborted at index ${index}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    return Object.freeze(results);
+    return inputs;
   }
 
-  private resolveSubLm(): BaseLM {
+  // --------------------------------------------------------------------------
+  // Step 2: LM resolution
+  // --------------------------------------------------------------------------
+
+  private resolvePrimaryLm(): BaseLM {
     const candidate = this.subLm ?? settings.lm;
-    if (!(candidate instanceof BaseLM)) {
+    if (!(candidate instanceof BaseLMClass)) {
       throw new ConfigurationError(
         'RLM sub-LM resolution failed. Configure settings.lm or pass options.subLm.',
       );
@@ -551,73 +289,401 @@ export class RLM<
     return candidate;
   }
 
-  private extractCode(action: Prediction): string {
-    const code = action.get('code');
-    if (typeof code !== 'string') {
-      throw new ValueError('RLM action predictor must emit a string code field.');
-    }
-    return stripCodeFences(code);
+  // --------------------------------------------------------------------------
+  // Step 3: Prompt construction
+  // --------------------------------------------------------------------------
+
+  /**
+   * Assemble the top-level prompt via the active adapter, then flatten
+   * the resulting message list into a deterministic single string. This
+   * preserves the repository's canonical prompt formatting instead of
+   * re-implementing a second prompt serializer inside RLM.
+   */
+  private buildPrompt(inputs: Record<string, unknown>): string {
+    const adapter = this.resolveAdapter();
+    const messages = adapter.format(this.signature, [], inputs);
+    return flattenMessages(messages);
   }
 
-  private normalizeSubmittedOutput(value: unknown): Record<string, unknown> {
-    // Intentionally NOT using isPlainObject() here: objects created inside the
-    // Node vm context have a different Object.prototype than the host realm,
-    // so prototype-based checks reject them. typeof+null+Array is cross-realm safe.
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      throw new ValueError('SUBMIT payload must be a plain object with output fields.');
+  private resolveAdapter(): Adapter {
+    const configured = settings.adapter;
+    if (configured === null || configured === undefined) {
+      return new JSONAdapter();
     }
-
-    const payload = value as Record<string, unknown>;
-    const output: Record<string, unknown> = {};
-    for (const [name, field] of this.signature.outputFields) {
-      if (!(name in payload)) {
-        throw new ValueError(`SUBMIT payload is missing required output field "${name}".`);
-      }
-      output[name] = coerceFieldValue(field.typeTag, payload[name]);
+    if (!(configured instanceof Adapter)) {
+      throw new RuntimeError('settings.adapter must be an Adapter instance');
     }
-    return output;
+    return configured;
   }
 
-  private normalizeExtractedOutput(prediction: Prediction): Record<string, unknown> {
-    const output: Record<string, unknown> = {};
-    for (const [name, field] of this.signature.outputFields) {
-      output[name] = coerceFieldValue(field.typeTag, prediction.get(name));
+  // --------------------------------------------------------------------------
+  // Step 4: Classifier resolution
+  // --------------------------------------------------------------------------
+
+  private async resolveClassifierResult(
+    prompt: string,
+    lm: BaseLM,
+  ): Promise<ClassifierResult> {
+    if (this.taskTypeOverride !== null) {
+      return {
+        primary: this.taskTypeOverride,
+        confidence: 1,
+        candidates: [this.taskTypeOverride],
+      };
     }
-    return output;
+    return this.classifier(prompt, this.signature, lm);
   }
 
-  private finalizePrediction(
-    result: Extract<ExecuteResult<unknown>, { readonly tag: 'submit' }>,
-    history: REPLHistory,
-    fault: CodeInterpreterError | null,
-  ): Prediction<TOutputs> {
-    const outputs = this.normalizeSubmittedOutput(result.output.value);
-    const payload: Record<string, unknown> = {
-      ...outputs,
-      final_via: result.output.via,
+  // --------------------------------------------------------------------------
+  // Step 5: Plan resolution + evaluation
+  // --------------------------------------------------------------------------
+
+  /**
+   * For a single-plan route, evaluate once. For a beam route, evaluate
+   * every plan concurrently, discard empty-string fallbacks, and then
+   * reduce the remaining candidates with a lightweight verifier oracle.
+   * Beam planning reserves a small slice of `maxOracleCalls` for that
+   * verifier step so each branch's self-consistency width is computed
+   * against a realistic route budget.
+   *
+   * Why not a `cross` wrapper? `cross` is list-typed; our templates
+   * return strings. Beam routing is semantically "try several and
+   * pick one", which maps cleanly to `Promise.all` + first-selection
+   * at the facade. The `composeBeamPlan` helper remains in the router
+   * as a structural utility for advanced callers who author plans
+   * that return lists and want a Cartesian product.
+   */
+  private async executeRoute(
+    route: RouteResult,
+    prompt: string,
+    ctx: EvaluationContext,
+  ): Promise<ExecutedRoute> {
+    if (route.kind === 'single') {
+      return {
+        answer: await this.runPlan(route.plan, prompt.length, ctx),
+        selectedTaskType: route.plan.taskType,
+      };
+    }
+    const planningBudget = reserveBeamPlanningBudget(
+      this.budget,
+      route.plans.length,
+    );
+    const results = await Promise.all(
+      route.plans.map(async (plan) => ({
+        answer: await this.runPlan(plan, prompt.length, ctx, planningBudget),
+        selectedTaskType: plan.taskType,
+      })),
+    );
+    const nonEmpty = results.filter((value) => value.answer.trim() !== '');
+    if (nonEmpty.length === 0) {
+      return (
+        results[0] ?? {
+          answer: '',
+          selectedTaskType: route.plans[0]?.taskType ?? 'summarise',
+        }
+      );
+    }
+    if (nonEmpty.length === 1) {
+      return nonEmpty[0]!;
+    }
+    return this.selectBeamCandidate(prompt, nonEmpty, ctx);
+  }
+
+  private async runPlan(
+    plan: StaticPlan,
+    promptLength: number,
+    ctx: EvaluationContext,
+    planningBudget: RLMBudget = this.budget,
+  ): Promise<string> {
+    const args: ResolvePlanArgs = {
+      plan: plan.template,
+      planningInputs: {
+        taskType: plan.taskType,
+        promptLength,
+        budget: planningBudget,
+      },
+      memorySchema: plan.memorySchema,
     };
+    const resolved = resolvePlan(args);
+    const planCtx = withPlanMemory(ctx, resolved.memorySchema);
+    const value = await evaluate(resolved.plan, planCtx);
+    return coerceAnswer(value);
+  }
 
-    if (this.config.trackTrace) {
-      payload.repl_history = history;
-      payload.repl_error = fault;
+  // --------------------------------------------------------------------------
+  // Step 6: Prediction assembly
+  // --------------------------------------------------------------------------
+
+  /**
+   * Populate a `Prediction` against the caller's signature. The
+   * evaluator returns a single string; the first output field of the
+   * signature receives that string. Every other output field is set
+   * to `undefined` at runtime (the generic `TOutputs` type is
+   * advisory; the adapter protocol is the source of truth on shape).
+   *
+   * When `trackTrace` is true, the returned prediction also carries:
+   *
+   * - `_rlm_route.kind` — `'single'` or `'beam'`.
+   * - `_rlm_route.taskTypes` — the list of dispatched task types.
+   * - `_rlm_route.selectedTaskType` — the branch that produced the
+   *   returned answer.
+   * - `_rlm_trace` — the evaluator's `EvaluationTrace[]`.
+   * - `_rlm_classifier` — the classifier result (post-override).
+   *
+   * These underscore-prefixed fields avoid colliding with user output
+   * names while remaining discoverable through `prediction.get()`.
+   */
+  private buildPrediction(
+    executed: ExecutedRoute,
+    classifierResult: ClassifierResult,
+    route: RouteResult,
+    ctx: EvaluationContext,
+  ): Prediction<TOutputs> {
+    const payload: Record<string, unknown> = {};
+    const outputNames = [...this.signature.outputFields.keys()];
+    for (const name of outputNames) {
+      payload[name] = undefined;
     }
-
+    if (outputNames.length > 0 && outputNames[0] !== undefined) {
+      payload[outputNames[0]] = executed.answer;
+    }
+    if (this.trackTrace) {
+      payload._rlm_route = buildRouteMetadata(route, executed.selectedTaskType);
+      payload._rlm_classifier = classifierResult;
+      payload._rlm_trace = ctx.trace satisfies readonly EvaluationTrace[];
+    }
     return Prediction.create<TOutputs>(payload);
   }
 
-  private finalizeExtractPrediction(
-    outputs: Record<string, unknown>,
-    history: REPLHistory,
-    fault: CodeInterpreterError | null,
-  ): Prediction<TOutputs> {
-    const payload: Record<string, unknown> = {
-      ...outputs,
-      final_via: 'extract',
-    };
-    if (this.config.trackTrace) {
-      payload.repl_history = history;
-      payload.repl_error = fault;
-    }
-    return Prediction.create<TOutputs>(payload);
+  private async selectBeamCandidate(
+    prompt: string,
+    candidates: readonly ExecutedRoute[],
+    ctx: EvaluationContext,
+  ): Promise<ExecutedRoute> {
+    const verdicts = await Promise.all(
+      candidates.map((candidate) =>
+        this.verifyBeamCandidate(prompt, candidate.answer, ctx),
+      ),
+    );
+    const selectedIndex = verdicts.findIndex((verdict) => verdict);
+    return candidates[selectedIndex >= 0 ? selectedIndex : 0]!;
   }
+
+  private async verifyBeamCandidate(
+    prompt: string,
+    candidate: string,
+    ctx: EvaluationContext,
+  ): Promise<boolean> {
+    consumeOracleBudget(ctx);
+      const prediction = await new Predict(RLM_VERIFIER_SIGNATURE).acall({
+      prompt,
+      candidate,
+      lm: ctx.lm,
+    });
+    return prediction.get('verdict') === true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function normalizeHandlers(
+  handlers?: readonly EffectHandler[],
+): ReadonlyMap<string, EffectHandler> {
+  if (handlers === undefined || handlers.length === 0) {
+    return new Map<string, EffectHandler>();
+  }
+  const out = new Map<string, EffectHandler>();
+  for (const handler of handlers) {
+    if (typeof handler.name !== 'string' || handler.name.trim() === '') {
+      throw new ValueError(
+        'RLM effect handler must have a non-empty `name` string.',
+      );
+    }
+    if (out.has(handler.name)) {
+      throw new ValueError(
+        `Duplicate RLM effect handler name "${handler.name}".`,
+      );
+    }
+    out.set(handler.name, handler);
+  }
+  return out;
+}
+
+/**
+ * Merge a user-supplied `plans` array with the built-in static plan
+ * registry. User plans take precedence on duplicate `taskType` tags.
+ * Throws `ValueError` on duplicate tags within the user list itself —
+ * that's almost always an authoring bug.
+ */
+function mergePlans(
+  overrides?: readonly StaticPlan[],
+): ReadonlyMap<TaskType, StaticPlan> {
+  if (overrides === undefined || overrides.length === 0) {
+    return STATIC_PLANS;
+  }
+  const out = new Map<TaskType, StaticPlan>(STATIC_PLANS);
+  const seen = new Set<TaskType>();
+  for (const plan of overrides) {
+    if (!isTaskType(plan.taskType)) {
+      throw new ValueError(
+        `RLM plan has invalid taskType "${String(plan.taskType)}".`,
+      );
+    }
+    if (seen.has(plan.taskType)) {
+      throw new ValueError(
+        `Duplicate RLM plan for taskType "${plan.taskType}" in options.plans.`,
+      );
+    }
+    seen.add(plan.taskType);
+    out.set(plan.taskType, plan);
+  }
+  return out;
+}
+
+/**
+ * Coerce an arbitrary evaluator return value to the string the RLM
+ * facade exposes. Strings pass through; objects/arrays are
+ * `JSON.stringify`'d; primitives are `String()`'d. The evaluator only
+ * legally returns strings for the default static plans, but the
+ * facade still stringifies plain objects so a custom plan that returns,
+ * e.g., a list is not coerced to `[object Object]`. `JSON.stringify`
+ * throws on cycles — that surfaces as a hard error rather than a
+ * misleading string.
+ */
+function coerceAnswer(value: CombinatorValue): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+/**
+ * Attach a plan's memory schema to an `EvaluationContext`.
+ *
+ * The shared counters (budget, trace, callsUsed, handlers) are
+ * preserved so a beam-routed run bills against a single top-level
+ * budget. Memory is forked per plan: the schema lands in
+ * `memorySchema`, and `memoryCell` is seeded from
+ * `initialMemoryState` so each plan starts with its own declared
+ * initial values (or an empty state when the plan has no schema).
+ *
+ * The forked context shares `trace`, `callsUsed`, `handlers`, and
+ * `scope` references with the parent — those are the cross-plan
+ * accumulators — and replaces only the memory-related fields.
+ */
+function withPlanMemory(
+  ctx: EvaluationContext,
+  memorySchema: MemorySchema | null,
+): EvaluationContext {
+  if (memorySchema === null) {
+    if (ctx.memorySchema === null) return ctx;
+    return {
+      ...ctx,
+      memorySchema: null,
+      memoryCell: { current: EMPTY_TYPED_MEMORY_STATE },
+    };
+  }
+  return {
+    ...ctx,
+    memorySchema,
+    memoryCell: { current: initialMemoryState(memorySchema) },
+  };
+}
+
+function consumeOracleBudget(ctx: EvaluationContext): void {
+  ctx.callsUsed.current += 1;
+  if (ctx.callsUsed.current > ctx.budget.maxOracleCalls) {
+    throw new BudgetError(
+      `RLM oracle call budget exceeded (used=${ctx.callsUsed.current}, max=${ctx.budget.maxOracleCalls})`,
+    );
+  }
+}
+
+function reserveBeamPlanningBudget(
+  budget: RLMBudget,
+  branchCount: number,
+): RLMBudget {
+  if (branchCount <= 1) {
+    return budget;
+  }
+  const remainingCalls = Math.max(1, budget.maxOracleCalls - branchCount);
+  return Object.freeze({
+    ...budget,
+    maxOracleCalls: Math.max(1, Math.floor(remainingCalls / branchCount)),
+  });
+}
+
+interface ExecutedRoute {
+  readonly answer: string;
+  readonly selectedTaskType: TaskType;
+}
+
+function buildRouteMetadata(
+  route: RouteResult,
+  selectedTaskType: TaskType,
+): {
+  readonly kind: RouteResult['kind'];
+  readonly taskTypes: readonly TaskType[];
+  readonly selectedTaskType: TaskType;
+} {
+  if (route.kind === 'single') {
+    return {
+      kind: 'single',
+      taskTypes: [route.plan.taskType],
+      selectedTaskType: route.plan.taskType,
+    };
+  }
+  return {
+    kind: 'beam',
+    taskTypes: route.plans.map((p) => p.taskType),
+    selectedTaskType,
+  };
+}
+
+function normalizeRouteThreshold(value: number | undefined): number {
+  if (value === undefined) {
+    return 0.7;
+  }
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new ValueError(
+      `RLM options.routeThreshold must be a finite number in [0, 1], got ${String(value)}.`,
+    );
+  }
+  return value;
+}
+
+function normalizeRouteBeamTopK(value: number | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_BEAM_TOP_K;
+  }
+  if (!Number.isInteger(value) || value < 2) {
+    throw new ValueError(
+      `RLM options.routeBeamTopK must be an integer >= 2, got ${String(value)}.`,
+    );
+  }
+  return value;
+}
+
+function flattenMessages(messages: readonly Message[]): string {
+  return messages
+    .map((message) => {
+      const content = flattenMessageContent(message.content).trim();
+      return content === ''
+        ? `[${message.role.toUpperCase()}]`
+        : `[${message.role.toUpperCase()}]\n${content}`;
+    })
+    .join('\n\n');
+}
+
+function flattenMessageContent(content: Message['content']): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  return content
+    .map((part) => (part.type === 'text' ? (part.text ?? '') : ''))
+    .join('\n');
 }

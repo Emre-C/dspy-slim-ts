@@ -5,8 +5,7 @@
 //   node tools/deps_rlm_legacy.mjs            # informational report, exits 0
 //   node tools/deps_rlm_legacy.mjs --strict   # fails with exit 1 if any legacy symbol is found
 //
-// The --strict form is attached to the release gate starting in Phase 9 of
-// the RLM v2 rollout (see docs/RLM_V2_IMPLEMENTATION_PLAN.md).
+// CI uses `--strict` to fail on legacy RLM v1 symbols (see docs/product/rlm-v2-architecture.md).
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { argv, exit, cwd } from 'node:process';
@@ -100,6 +99,6 @@ if (strict) {
 }
 
 console.log(
-  '[deps:rlm-legacy] Informational only. Run with --strict (Phase 9+) to fail CI on residue.',
+  '[deps:rlm-legacy] Informational only. Run with --strict to fail CI on residue.',
 );
 exit(0);

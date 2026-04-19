@@ -1,6 +1,18 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "entry": ["tests/**/*.test.ts"],
-  "project": ["src/**/*.ts", "tests/**/*.ts"],
+  "entry": [
+    "tests/**/*.test.ts",
+    "examples/**/*.ts",
+    "tools/**/*.ts",
+    "!tools/colgrep-mcp/**",
+    "tools/**/*.mjs"
+  ],
+  "project": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "examples/**/*.ts",
+    "tools/**/*.{ts,mjs}",
+    "!tools/colgrep-mcp/**"
+  ],
   "ignoreBinaries": ["uv", "tsx"]
 }

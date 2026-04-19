@@ -49,14 +49,9 @@ class RejectingLM extends BaseLM {
 }
 
 /**
- * `BaseLM` subclass that emits pre-scripted outputs one per call, records
- * the kwargs forwarded by the adapter, and throws once the queue is
- * exhausted. This is the Phase 2 workhorse for oracle/vote/ensemble tests —
- * one instance per model in the ensemble registry.
- *
- * `outputs` are raw adapter payloads (JSONAdapter reads them as JSON).
- * The default signature is `prompt: str -> answer: str`, so e.g.
- * `'{"answer": "Paris"}'` is the canonical happy-path output.
+ * Scripted `BaseLM`: one queued JSON payload per call. Direct `oracle` leaves
+ * use `EFFECT_ORACLE_SIGNATURE` — use `oracleValue()` for terminal `kind:
+ * value` payloads. `vote` lanes still use the plain `answer` signature.
  */
 interface ScriptedCall {
   readonly prompt: string | undefined;
@@ -94,6 +89,16 @@ class ScriptedLM extends BaseLM {
 const DEFAULT_SIGNATURE: Signature = signatureFromString(
   'prompt: str -> answer: str',
 );
+
+/** JSON for a terminal `kind: value` oracle completion (`EFFECT_ORACLE_SIGNATURE`). */
+function oracleValue(answer: string): string {
+  return JSON.stringify({
+    kind: 'value',
+    value: answer,
+    effect_name: null,
+    effect_args: null,
+  });
+}
 
 function makeCtx(
   overrides: Partial<BuildEvaluationContextOptions> = {},
@@ -284,9 +289,7 @@ describe('evaluate — filter', () => {
     // the boolean itself for this test instead of a dict lookup.
     const simplePlan = filter(fn('x', vref('x')), lit([true, false, true]));
     await expect(evaluate(simplePlan, makeCtx())).resolves.toEqual([true, true]);
-    // Smoke-check the more realistic shape won't typecheck cleanly without
-    // a dot-access combinator (not in scope for Phase 1), so leave the
-    // dict-based plan as authored but unused.
+    // Dict-shaped filter body is unused here — kept as a smoke artifact.
     void plan;
   });
 
@@ -433,19 +436,11 @@ describe('evaluate — cross', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Oracle — Phase 2 wiring
-// ---------------------------------------------------------------------------
-//
-// Every test here drives `evaluate` through a `ScriptedLM` to confirm the
-// network boundary is wired, not just the AST. Three axes are covered:
-// (1) the happy path produces the scripted answer; (2) the prompt from the
-// AST actually reaches the LM (kwargs/messages inspection); (3) the
-// `maxOracleCalls` budget is enforced exactly at the invocation boundary.
+// Oracle: scripted LM, prompt forwarding, registry fallback, budget.
 
-describe('evaluate — oracle (Phase 2)', () => {
+describe('evaluate — oracle', () => {
   it('returns the scripted answer on the happy path', async () => {
-    const lm = new ScriptedLM('primary', ['{"answer": "Paris"}']);
+    const lm = new ScriptedLM('primary', [oracleValue('Paris')]);
     const ctx = makeCtx({ lm });
     await expect(
       evaluate(oracle(lit('what is the capital of France?')), ctx),
@@ -455,7 +450,7 @@ describe('evaluate — oracle (Phase 2)', () => {
   });
 
   it('forwards the prompt string into the adapter messages', async () => {
-    const lm = new ScriptedLM('primary', ['{"answer": "42"}']);
+    const lm = new ScriptedLM('primary', [oracleValue('42')]);
     const ctx = makeCtx({ lm });
     await evaluate(oracle(lit('the ultimate question')), ctx);
     const text = JSON.stringify(lm.calls[0]?.messages ?? []);
@@ -463,8 +458,8 @@ describe('evaluate — oracle (Phase 2)', () => {
   });
 
   it('routes via modelHint when the registry has a match', async () => {
-    const fallback = new ScriptedLM('default', ['{"answer": "wrong"}']);
-    const fast = new ScriptedLM('fast', ['{"answer": "fast-answer"}']);
+    const fallback = new ScriptedLM('default', [oracleValue('wrong')]);
+    const fast = new ScriptedLM('fast', [oracleValue('fast-answer')]);
     const ctx = makeCtx({
       lm: fallback,
       lmRegistry: new Map([['fast', fast]]),
@@ -477,7 +472,7 @@ describe('evaluate — oracle (Phase 2)', () => {
   });
 
   it('falls back to ctx.lm when the modelHint is unknown', async () => {
-    const fallback = new ScriptedLM('default', ['{"answer": "fallback"}']);
+    const fallback = new ScriptedLM('default', [oracleValue('fallback')]);
     const ctx = makeCtx({
       lm: fallback,
       lmRegistry: new Map(), // empty registry
@@ -489,7 +484,7 @@ describe('evaluate — oracle (Phase 2)', () => {
   });
 
   it('throws BudgetError when callsUsed would exceed maxOracleCalls', async () => {
-    const lm = new ScriptedLM('primary', ['{"answer": "never"}']);
+    const lm = new ScriptedLM('primary', [oracleValue('never')]);
     const ctx = makeCtx({ lm, budget: { maxOracleCalls: 0 } });
     await expect(
       evaluate(oracle(lit('hi')), ctx),
@@ -505,17 +500,9 @@ describe('evaluate — oracle (Phase 2)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Vote — Phase 2 wiring
-// ---------------------------------------------------------------------------
-//
-// Vote fans `n` oracle calls (all under the same `modelHint`) and reduces
-// them via `majority` (default), `mode` (alias), or `verifier`. Coverage:
-// (1) majority happy path; (2) all N calls consume the oracle budget;
-// (3) bounded parallelism holds; (4) ties break on first-seen order;
-// (5) the verifier reducer chains a second LM round.
+// Vote: N lanes, majority / verifier, parallelism cap, budget.
 
-describe('evaluate — vote (Phase 2)', () => {
+describe('evaluate — vote', () => {
   it('majority reducer picks the most common answer', async () => {
     const lm = new ScriptedLM('primary', [
       '{"answer": "A"}',
@@ -635,16 +622,9 @@ describe('evaluate — vote (Phase 2)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Ensemble — Phase 2 wiring
-// ---------------------------------------------------------------------------
-//
-// Ensemble fans across a declared list of `modelHint`s (one call each).
-// Coverage: (1) confidence reducer (default); (2) majority across models;
-// (3) verifier reducer; (4) invalid confidence surfaces as `ValueError`;
-// (5) empty model list is rejected before any call.
+// Ensemble: per-model hints, confidence / majority / verifier reducers.
 
-describe('evaluate — ensemble (Phase 2)', () => {
+describe('evaluate — ensemble', () => {
   it('confidence reducer picks the highest-confidence response (default)', async () => {
     const fast = new ScriptedLM('fast', [
       '{"answer": "fast-pick", "confidence": 0.3}',
@@ -790,7 +770,7 @@ describe('evaluate — map parallelism', () => {
     const items = Array.from({ length: 10 }, (_, i) => `item-${i}`);
     let inFlight = 0;
     let maxInFlight = 0;
-    const scripted = Array.from({ length: 10 }, () => '{"answer": "ok"}');
+    const scripted = Array.from({ length: 10 }, () => oracleValue('ok'));
 
     class TrackingLM extends BaseLM {
       constructor() {
@@ -801,7 +781,7 @@ describe('evaluate — map parallelism', () => {
         maxInFlight = Math.max(maxInFlight, inFlight);
         await new Promise((r) => setTimeout(r, 1));
         inFlight -= 1;
-        return [scripted.shift() ?? '{"answer": "extra"}'];
+        return [scripted.shift() ?? oracleValue('extra')];
       }
     }
 

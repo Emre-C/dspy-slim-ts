@@ -1,8 +1,13 @@
 /**
  * Shared GEPA substrate contracts.
+ *
+ * `PredictorTrace.executionTrace` is `EvaluationTrace[] | null` — the same
+ * structural trace RLM v2 records on `EvaluationContext.trace`, or any
+ * compatible slice another runtime attaches for audit.
  */
 
-import type { REPLHistory } from './rlm_types.js';
+import type { JsonValue } from './json_value.js';
+import type { EvaluationTrace } from './rlm_trace_types.js';
 
 export interface PredictorTarget {
   readonly targetId: number;
@@ -13,7 +18,8 @@ export interface PredictorTarget {
 export interface MetricRecord {
   readonly score: number | null;
   readonly subscores: readonly number[];
-  readonly feedback: unknown | null;
+  /** Arbitrary metric payload; expected JSON-serializable in practice. */
+  readonly feedback: JsonValue | null;
   readonly failed: boolean;
 }
 
@@ -23,7 +29,15 @@ export interface PredictorTrace<TInput = unknown, TOutput = unknown> {
   readonly input: TInput;
   readonly output: TOutput | null;
   readonly metric: MetricRecord;
-  readonly history: REPLHistory | null;
+  /**
+   * Runtime-agnostic execution trace. `null` when the predictor ran
+   * without producing trace data (e.g., a plain `Predict` whose trace
+   * was disabled by `trackTrace: false`). The optimizer treats this
+   * field as opaque structural data — it reads `step`, `nodeTag`, and
+   * `ok` for audit purposes but otherwise forwards it verbatim into the
+   * `ReflectiveDatum` for downstream instruction-synthesis steps.
+   */
+  readonly executionTrace: readonly EvaluationTrace[] | null;
 }
 
 export interface ReflectiveDatum<TInput = unknown, TOutput = unknown> {
