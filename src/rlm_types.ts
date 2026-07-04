@@ -48,6 +48,13 @@ export interface RLMBudget {
  * The canonical default budget. Frozen to guard against accidental mutation.
  * See `docs/product/rlm-v2-architecture.md` §0.6 for the rationale behind each
  * number.
+ *
+ * `maxEffectTurns` at 64 reflects long-horizon task requirements: iterative
+ * state-tracking (BlocksWorld, Sudoku, chess) routinely needs many tens of
+ * effect turns per oracle call to read context, update memory, and
+ * converge on a terminal `value`. The previous cap of 8 was a toy-tier
+ * budget that forced spurious `BudgetError`s on otherwise-healthy loops;
+ * callers who need tight budgets still override via `RLMBudget`.
  */
 export const DEFAULT_BUDGET: RLMBudget = Object.freeze({
   maxOracleCalls: 200,
@@ -55,7 +62,7 @@ export const DEFAULT_BUDGET: RLMBudget = Object.freeze({
   maxDepth: 6,
   leafThreshold: 1000,
   selfConsistencyN: 5,
-  maxEffectTurns: 8,
+  maxEffectTurns: 64,
 });
 
 function mergeBudgetInt(

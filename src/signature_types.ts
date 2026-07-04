@@ -21,6 +21,7 @@
  * parser in `src/signature.ts`.
  */
 
+import type { Image } from './image.js';
 import type { Signature } from './signature.js';
 
 // ── Whitespace handling ─────────────────────────────────────────────────
@@ -39,6 +40,7 @@ type MapTypeTag<T extends string> =
   T extends 'bool' ? boolean :
   T extends 'list' ? readonly unknown[] :
   T extends 'dict' ? Record<string, unknown> :
+  T extends 'Image' | 'image' ? Image :
   unknown;
 
 /**

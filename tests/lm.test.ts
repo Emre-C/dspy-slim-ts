@@ -158,6 +158,78 @@ describe('LM', () => {
     expect(await lm.acall(undefined, [{ role: 'user', content: 'second' }])).toEqual(['']);
   });
 
+  it('uses message.reasoning when content is null (reasoning-only OpenAI-compatible)', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'MiniMaxAI/MiniMax-M2.7',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: null,
+              reasoning: 'think step by step',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 2, completion_tokens: 10, total_tokens: 12 },
+      },
+    });
+
+    const lm = new LM('MiniMaxAI/MiniMax-M2.7', { apiKey: 'sk-test', fetch: fetchMock });
+    expect(await lm.acall(undefined, [{ role: 'user', content: 'hi' }])).toEqual(['think step by step']);
+  });
+
+  it('prefers reasoning_content over reasoning when content is empty', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'deepseek/deepseek-r1',
+        choices: [
+          {
+            message: {
+              content: null,
+              reasoning_content: 'rc',
+              reasoning: 'r',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      },
+    });
+
+    const lm = new LM('deepseek/deepseek-r1', { apiKey: 'sk-test', fetch: fetchMock });
+    expect(await lm.acall(undefined, [{ role: 'user', content: 'x' }])).toEqual(['rc']);
+  });
+
+  it('floors max_completion_tokens for minimaxai/* models (Together / HF ids)', async () => {
+    const fetchMock = mockFetch({
+      body: {
+        model: 'MiniMaxAI/MiniMax-M2.7',
+        choices: [
+          {
+            message: { content: '{"a":1}' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      },
+    });
+
+    const lm = new LM('MiniMaxAI/MiniMax-M2.7', {
+      apiKey: 'sk-test',
+      fetch: fetchMock,
+    });
+
+    await lm.acall(undefined, [{ role: 'user', content: 'Answer as JSON.' }], {
+      max_completion_tokens: 2048,
+    });
+
+    const body = requestBodyFromFetchCall(fetchMock, 0);
+    expect(body.model).toBe('MiniMaxAI/MiniMax-M2.7');
+    expect(body.max_completion_tokens).toBe(4096);
+  });
+
   it('concatenates chat completion content delivered as text parts (OpenAI-compatible)', async () => {
     const fetchMock = mockFetch({
       body: {
@@ -315,6 +387,67 @@ describe('LM', () => {
     expect(body.reasoning).toEqual({
       exclude: true,
     });
+  });
+
+  it('aggregates OpenAI SSE streaming into a single completion (mitigates gateway timeouts)', async () => {
+    const sse = [
+      'data: {"id":"1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"He"},"finish_reason":null}]}',
+      '',
+      'data: {"id":"1","choices":[{"delta":{"content":"llo"},"finish_reason":null}]}',
+      '',
+      'data: {"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+    ].join('\n');
+
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sse));
+          controller.close();
+        },
+      }),
+      text: async () => {
+        throw new Error('non-streaming path should not call response.text()');
+      },
+    }));
+
+    const lm = new LM('openai/gpt-4.1-mini', { apiKey: 'sk-test', fetch: fetchMock });
+    const out = await lm.acall(undefined, [{ role: 'user', content: 'hi' }], { stream: true });
+
+    expect(out).toEqual(['Hello']);
+    expect(requestBodyFromFetchCall(fetchMock, 0).stream).toBe(true);
+    expect((fetchMock.mock.calls[0] as [string])[0]).toContain('/chat/completions');
+  });
+
+  it('aggregates reasoning deltas from SSE streaming when final content is empty', async () => {
+    const sse = [
+      'data: {"model":"MiniMaxAI/x","choices":[{"delta":{"reasoning_content":"step "}}]}',
+      'data: {"choices":[{"delta":{"reasoning_content":"done"}}]}',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      'data: [DONE]',
+    ].join('\n');
+
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sse));
+          controller.close();
+        },
+      }),
+      text: async () => {
+        throw new Error('non-streaming path should not call response.text()');
+      },
+    }));
+
+    const lm = new LM('MiniMaxAI/MiniMax-M2.7', { apiKey: 'sk-test', fetch: fetchMock });
+    const out = await lm.acall(undefined, [{ role: 'user', content: 'hi' }], { stream: true });
+
+    expect(out).toEqual(['step done']);
   });
 
   it('flattens extra_body and preserves explicit Minimax reasoning overrides', async () => {

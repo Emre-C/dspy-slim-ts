@@ -79,6 +79,31 @@ function assertDistinctFieldNames(
   }
 }
 
+/**
+ * Parse a parametric bracket suffix like `[str]` or `[str, int]` into
+ * its inner `TypeTag` arguments. Brackets that wrap non-`TypeTag`
+ * payloads (e.g. `literal["a", "b"]`, `enum[R, G, B]`) fall through
+ * with an empty args array; the caller should store the base tag and
+ * let the runtime validator do literal-level checking elsewhere.
+ *
+ * This is *not* a full type-parameter parser — it only handles a
+ * flat, single-level argument list. Nested parametric args
+ * (`list[list[int]]`) and parametric sub-expressions are out of
+ * scope; they currently degrade to the base tag only.
+ */
+function parseTypeArgs(inner: string): readonly TypeTag[] {
+  const segments = splitTopLevel(inner, ',', true).map((segment) => segment.trim());
+  const args: TypeTag[] = [];
+  for (const segment of segments) {
+    if (segment === '') continue;
+    if (!isTypeTag(segment)) {
+      return [];
+    }
+    args.push(segment);
+  }
+  return args;
+}
+
 function parseFieldList(raw: string, kind: FieldKind): readonly ParsedField[] {
   if (raw.trim() === '') {
     return [];
@@ -105,21 +130,41 @@ function parseFieldList(raw: string, kind: FieldKind): readonly ParsedField[] {
       const bracketIndex = rawType.indexOf('[');
       const baseType =
         bracketIndex === -1 ? rawType : rawType.slice(0, bracketIndex).trim();
-      const typeTag = isTypeTag(baseType) ? baseType : 'custom';
+      // `Image` is the canonical multimodal alias; users write
+      // `page_image: Image` to declare a vision input. Lower-case it to
+      // the `image` `TypeTag` so the rest of the pipeline sees a single
+      // form. Other casing is intentionally not aliased — `Str` etc.
+      // remain `custom` to surface user typos rather than silently
+      // succeed.
+      const aliasedBase = baseType === 'Image' ? 'image' : baseType;
+      const typeTag = isTypeTag(aliasedBase) ? aliasedBase : 'custom';
 
+      let typeArgs: readonly TypeTag[] = [];
+      if (bracketIndex !== -1) {
+        if (!rawType.endsWith(']')) {
+          throw new ValueError(
+            `Field "${name}" has an unterminated type parameter list in "${rawType}"`,
+          );
+        }
+        const inner = rawType.slice(bracketIndex + 1, -1);
+        typeArgs = parseTypeArgs(inner);
+      }
+
+      // Validate via Field.create to surface bad type args eagerly.
       createField({
         kind,
         name,
         typeTag,
+        typeArgs,
         isTypeUndefined: false,
       });
 
-      return { name, typeTag, isTypeUndefined: false };
+      return { name, typeTag, typeArgs, isTypeUndefined: false };
     }
 
     const name = trimmed;
     createField({ kind, name });
-    return { name, typeTag: 'str', isTypeUndefined: true };
+    return { name, typeTag: 'str', typeArgs: [], isTypeUndefined: true };
   });
 }
 
@@ -375,6 +420,12 @@ export function signatureFields(sig: Signature): readonly Field[] {
 export interface ParsedField {
   readonly name: string;
   readonly typeTag: TypeTag;
+  /**
+   * Inner type arguments extracted from a parametric tag (`optional[str]`,
+   * `list[int]`, etc.). Empty when the tag has no brackets or the inner
+   * payload is not a simple `TypeTag` list (e.g. `literal["a", "b"]`).
+   */
+  readonly typeArgs: readonly TypeTag[];
   readonly isTypeUndefined: boolean;
 }
 
@@ -432,6 +483,7 @@ export function signatureFromString(
             kind: 'input',
             name: pf.name,
             typeTag: pf.typeTag,
+            typeArgs: pf.typeArgs,
             isTypeUndefined: false,
           }),
     );
@@ -447,6 +499,7 @@ export function signatureFromString(
             kind: 'output',
             name: pf.name,
             typeTag: pf.typeTag,
+            typeArgs: pf.typeArgs,
             isTypeUndefined: false,
           }),
     );

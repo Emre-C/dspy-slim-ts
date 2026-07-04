@@ -117,12 +117,12 @@ function budget(overrides: Partial<RLMBudget> = {}): RLMBudget {
 // ---------------------------------------------------------------------------
 
 describe('STATIC_PLANS', () => {
-  it('contains exactly the six non-unknown task types', () => {
+  it('contains exactly the non-unknown task types', () => {
     expect([...STATIC_PLANS.keys()].sort()).toEqual(
       [...REAL_TASK_TYPES_LIST].sort(),
     );
     expect(STATIC_PLANS.has('unknown')).toBe(false);
-    expect(STATIC_PLANS.size).toBe(6);
+    expect(STATIC_PLANS.size).toBe(REAL_TASK_TYPES_LIST.length);
   });
 
   it('every plan carries its own taskType tag', () => {
@@ -131,13 +131,20 @@ describe('STATIC_PLANS', () => {
     }
   });
 
-  it('every plan template references vref("input") and includes k or n placeholders', () => {
-    for (const plan of STATIC_PLANS.values()) {
+  it('every plan template references vref("input") and tunable plans include k or n placeholders', () => {
+    for (const [taskType, plan] of STATIC_PLANS) {
       const json = JSON.stringify(plan.template);
       expect(json).toContain('"name":"input"');
-      // Every template must be parameterized on either k, n, or both, or
-      // the planner has nothing to tune. pairwise uses k=2; classify uses
-      // n only; others use both.
+      // `solve` is structurally a single oracle leaf on the full input;
+      // no `split`/`vote` means there is nothing for the planner to tune
+      // via k/n placeholders, and the quality curve for `solve` returns
+      // the minimum legal k. Every other plan must parameterize on k,
+      // n, or both.
+      if (taskType === 'solve') {
+        expect(json.includes('"name":"k"')).toBe(false);
+        expect(json.includes('"name":"n"')).toBe(false);
+        continue;
+      }
       const usesKOrN =
         json.includes('"name":"k"') || json.includes('"name":"n"');
       expect(usesKOrN).toBe(true);
@@ -194,10 +201,16 @@ describe('STATIC_PLANS', () => {
     expect(resolved.partitionK).toBe(2);
   });
 
-  it('search / aggregate / summarise / multi_hop ship the failure_diagnostic schema', () => {
-    const expected = new Set(['search', 'aggregate', 'summarise', 'multi_hop']);
+  it('plans attach the correct memory schema (failure_diagnostic, solver_state, or none)', () => {
+    const failureDiagnosticPlans = new Set([
+      'search',
+      'aggregate',
+      'summarise',
+      'multi_hop',
+    ]);
+    const solverStatePlans = new Set(['solve']);
     for (const [taskType, plan] of STATIC_PLANS) {
-      if (expected.has(taskType)) {
+      if (failureDiagnosticPlans.has(taskType)) {
         expect(plan.memorySchema).not.toBeNull();
         expect(plan.memorySchema?.name).toBe('failure_diagnostic');
         expect(plan.memorySchema?.fields.map((f) => f.name)).toEqual([
@@ -205,10 +218,29 @@ describe('STATIC_PLANS', () => {
           'next_check',
           'prevented_action',
         ]);
+      } else if (solverStatePlans.has(taskType)) {
+        expect(plan.memorySchema).not.toBeNull();
+        expect(plan.memorySchema?.name).toBe('solver_state');
+        expect(plan.memorySchema?.fields.map((f) => f.name)).toEqual([
+          'current_state',
+          'moves_so_far',
+          'step_notes',
+        ]);
       } else {
         expect(plan.memorySchema).toBeNull();
       }
     }
+  });
+
+  it('solve plan is a single oracle leaf (no split/vote/ensemble/map)', () => {
+    const plan = STATIC_PLANS.get('solve');
+    expect(plan).toBeDefined();
+    const json = JSON.stringify(plan!.template);
+    expect(json).not.toContain('"tag":"split"');
+    expect(json).not.toContain('"tag":"vote"');
+    expect(json).not.toContain('"tag":"ensemble"');
+    expect(json).not.toContain('"tag":"map"');
+    expect(plan!.template.tag).toBe('oracle');
   });
 });
 

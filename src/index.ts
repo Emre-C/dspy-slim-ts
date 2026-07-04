@@ -26,6 +26,9 @@ export { BaseCallback, currentCallID } from './callback.js';
 export type { FieldInit } from './field.js';
 export { Field, createField } from './field.js';
 
+export type { SupportedImageMime } from './image.js';
+export { Image, isImage } from './image.js';
+
 export type { ParsedField, ParseResult, SignatureOptions } from './signature.js';
 export {
   Signature,

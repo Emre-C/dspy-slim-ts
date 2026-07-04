@@ -205,13 +205,50 @@ describe('Signature hardening', () => {
       'payload: dict[str, int], verdict: literal["yes, please", "no"] -> answer: union[str, bool]',
     );
 
+    // `dict[str, int]` and `union[str, bool]` yield two parsed TypeTag
+    // args; `literal["...", "..."]` yields none because the inner payload
+    // is not a TypeTag list (it is a literal value list, validated
+    // elsewhere).
     expect(result.inputs).toEqual([
-      { name: 'payload', typeTag: 'dict', isTypeUndefined: false },
-      { name: 'verdict', typeTag: 'literal', isTypeUndefined: false },
+      { name: 'payload', typeTag: 'dict', typeArgs: ['str', 'int'], isTypeUndefined: false },
+      { name: 'verdict', typeTag: 'literal', typeArgs: [], isTypeUndefined: false },
     ]);
     expect(result.outputs).toEqual([
-      { name: 'answer', typeTag: 'union', isTypeUndefined: false },
+      { name: 'answer', typeTag: 'union', typeArgs: ['str', 'bool'], isTypeUndefined: false },
     ]);
+  });
+
+  it('surfaces the inner TypeTag of optional[T] fields', () => {
+    const result = parseSignature(
+      'question: str -> answer: optional[str], count: optional[int]',
+    );
+
+    expect(result.outputs).toEqual([
+      { name: 'answer', typeTag: 'optional', typeArgs: ['str'], isTypeUndefined: false },
+      { name: 'count', typeTag: 'optional', typeArgs: ['int'], isTypeUndefined: false },
+    ]);
+  });
+
+  it('parses bare optional with an empty typeArgs list', () => {
+    const result = parseSignature('question: str -> flag: optional');
+
+    expect(result.outputs).toEqual([
+      { name: 'flag', typeTag: 'optional', typeArgs: [], isTypeUndefined: false },
+    ]);
+  });
+
+  it('signatureFromString threads typeArgs through to Field instances', () => {
+    const sig = signatureFromString(
+      'question: str -> answer: str, effect_args: optional[dict]',
+    );
+
+    expect(sig.outputFields.get('effect_args')?.typeArgs).toEqual(['dict']);
+  });
+
+  it('rejects an unterminated parametric type annotation', () => {
+    expect(() => parseSignature('question: str -> answer: list[str')).toThrow(
+      'Unbalanced delimiters',
+    );
   });
 
   it('rejects duplicate names within the input side', () => {

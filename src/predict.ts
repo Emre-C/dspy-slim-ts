@@ -7,6 +7,7 @@ import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
 import { Example } from './example.js';
 import { createField } from './field.js';
 import { isPlainObject } from './guards.js';
+import { isImage } from './image.js';
 import { BaseLM } from './lm.js';
 import { Module, markPredictor } from './module.js';
 import { snapshotRecord } from './owned_value.js';
@@ -67,6 +68,15 @@ function ensurePredictSignature(value: Signature | string): Signature {
   if (reservedInputs.length > 0) {
     throw new ValueError(
       `Predict input field names are reserved for control overrides: ${reservedInputs.join(', ')}.`,
+    );
+  }
+
+  const imageOutputs = [...signature.outputFields.values()]
+    .filter((field) => field.typeTag === 'image')
+    .map((field) => field.name);
+  if (imageOutputs.length > 0) {
+    throw new ValueError(
+      `Predict does not support Image output fields yet: ${imageOutputs.join(', ')}. Image fields are input-only in phase 1.`,
     );
   }
 
@@ -178,6 +188,8 @@ export class Predict<
     const inputs = this.populateDefaults(signature, filteredInputs);
 
     this.validateInputs(signature, providedInputs, inputs);
+    this.validateImageInputs(signature, inputs);
+    this.validateVisionCapability(signature, inputs, lm);
 
     return {
       adapter,
@@ -187,6 +199,78 @@ export class Predict<
       config,
       inputs,
     };
+  }
+
+  /**
+   * Keep Image values aligned with Image-typed input fields. The
+   * adapter emits multimodal parts by inspecting runtime values, so
+   * Predict enforces the signature contract before formatting.
+   */
+  validateImageInputs(signature: Signature, inputs: Record<string, unknown>): void {
+    const misplaced: string[] = [];
+    const malformed: string[] = [];
+
+    for (const [name, value] of Object.entries(inputs)) {
+      const field = signature.inputFields.get(name);
+      if (field === undefined) {
+        continue;
+      }
+
+      if (field.typeTag === 'image') {
+        if (!isImage(value)) {
+          malformed.push(name);
+        }
+        continue;
+      }
+
+      if (isImage(value)) {
+        misplaced.push(name);
+      }
+    }
+
+    if (malformed.length > 0) {
+      throw new ValueError(
+        `Image input field(s) must receive Image values: ${malformed.join(', ')}.`,
+      );
+    }
+
+    if (misplaced.length > 0) {
+      throw new ValueError(
+        `Image values require Image-typed signature fields. Declare ${misplaced.join(', ')} as Image or pass text/JSON instead.`,
+      );
+    }
+  }
+
+  /**
+   * Refuse to dispatch actual Image inputs against an LM that does not
+   * advertise `supportsVision`, avoiding a paid round trip that would
+   * either drop the image or fail opaquely at the provider boundary.
+   */
+  validateVisionCapability(
+    signature: Signature,
+    inputs: Record<string, unknown>,
+    lm: BaseLM,
+  ): void {
+    const imageFields: string[] = [];
+    for (const [name, field] of signature.inputFields) {
+      if (field.typeTag === 'image' && isImage(inputs[name])) {
+        imageFields.push(name);
+      }
+    }
+
+    if (imageFields.length === 0) {
+      return;
+    }
+
+    if (lm.supportsVision) {
+      return;
+    }
+
+    throw new ConfigurationError(
+      `Signature declares Image input field(s) [${imageFields.join(', ')}] but LM "${lm.model}" does not advertise vision support. `
+      + 'Either configure a vision-capable model (e.g. openrouter/google/gemini-3-flash-preview, openai/gpt-4o) '
+      + 'or pass forceVisionCapable: true on the LM if the model is known to accept image_url content parts.',
+    );
   }
 
   resolveSignature(kwargs: Record<string, unknown>): Signature {

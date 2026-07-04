@@ -19,6 +19,7 @@ import {
   signatureFromString,
   withInstructions,
 } from './signature.js';
+import { AdapterParseError } from './adapter.js';
 import { BudgetError, RuntimeError, ValueError } from './exceptions.js';
 import type {
   CombinatorBinary,
@@ -549,12 +550,27 @@ async function callOracleLeafWithEffects(
   const maxTurns = ctx.budget.maxEffectTurns;
   let prompt = initialPrompt;
   for (let turn = 0; turn < maxTurns; turn += 1) {
-    const prediction = await invokePredict(
-      EFFECT_ORACLE_SIGNATURE,
-      { prompt },
-      modelHint,
-      ctx,
-    );
+    let prediction;
+    try {
+      prediction = await invokePredict(
+        EFFECT_ORACLE_SIGNATURE,
+        { prompt },
+        modelHint,
+        ctx,
+      );
+    } catch (err) {
+      // Adapter boundary: malformed / unparseable LM payloads (bad JSON,
+      // missing required fields, failed inner-type coercion) are recoverable —
+      // feed the failure back to the LM as a structured block so the next
+      // effect turn can emit a corrected response. Budget and programmer
+      // errors still propagate unchanged.
+      if (err instanceof BudgetError) throw err;
+      if (!(err instanceof AdapterParseError)) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      prompt = appendRawError(prompt, message, turn);
+      pushEffectTrace(ctx, turn, 'adapter_parse_error', false);
+      continue;
+    }
     let response: OracleResponse;
     try {
       response = parseOracleResponse(prediction);

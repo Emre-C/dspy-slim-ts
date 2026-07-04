@@ -3,7 +3,7 @@
  */
 
 import { coerceBoolean, coerceJsonContainer, coerceNumber } from './codec.js';
-import type { Message } from './chat_message.js';
+import type { ContentPart, Message } from './chat_message.js';
 import type { Callback } from './callback.js';
 import { runWithCallbacks } from './callback.js';
 import { ConfigurationError, RuntimeError, ValueError } from './exceptions.js';
@@ -11,6 +11,7 @@ import { Example } from './example.js';
 import type { Field } from './field.js';
 import { isPlainObject } from './guards.js';
 import { isHistoryLike } from './history.js';
+import { Image, isImage } from './image.js';
 import type { BaseLM, LMOutput } from './lm.js';
 import {
   serializeOwnedValue,
@@ -40,10 +41,39 @@ interface AdapterCallPreprocessResult {
 
 const FIELD_HEADER_RE = /^\[\[ ## (\w+) ## \]\]/;
 
+/**
+ * A field declared `optional[T]` may be omitted by the LM in its
+ * response. `Field.typeTag === 'optional'` is the discriminator;
+ * `Field.typeArgs[0]` carries the inner type when the signature
+ * string used a bracketed form. Fields declared as bare `optional`
+ * (no brackets) still read as optional at the adapter layer but are
+ * coerced via the opaque `optional` branch (no inner coercion).
+ */
+function isOptionalField(field: Field): boolean {
+  return field.typeTag === 'optional';
+}
+
+/**
+ * The tag the adapter should use when rendering placeholders or
+ * coercing parsed values for a field. Unwraps one level of
+ * `optional[T]` so `<string (optional)>` / `coerceNumber` work as
+ * callers expect; leaves every other tag unchanged.
+ */
+function effectiveTypeTag(field: Field): TypeTag {
+  if (field.typeTag === 'optional' && field.typeArgs.length > 0) {
+    return field.typeArgs[0]!;
+  }
+  return field.typeTag;
+}
+
 function describeField(field: Field): string {
   const description = field.description.trim();
   const suffix = description === '' ? field.prefix : description;
-  return `- \`${field.name}\` (${field.typeTag}): ${suffix}`;
+  const optionalSuffix = isOptionalField(field) ? ', optional' : '';
+  const innerTag = isOptionalField(field) && field.typeArgs.length > 0
+    ? field.typeArgs[0]!
+    : field.typeTag;
+  return `- \`${field.name}\` (${innerTag}${optionalSuffix}): ${suffix}`;
 }
 
 function fieldBlock(name: string, value: unknown): string {
@@ -69,12 +99,33 @@ function placeholderForType(typeTag: TypeTag): string {
     case 'enum':
       return '<enum>';
     case 'optional':
-      return '<optional>';
+      return '<any>';
     case 'union':
       return '<union>';
     case 'custom':
       return '<custom>';
+    case 'image':
+      return '<image>';
   }
+}
+
+/**
+ * Placeholder variant that takes a whole `Field` so it can surface
+ * optionality to the LM (`<string (optional)>`). Prefer this over
+ * `placeholderForType(field.typeTag)` at every site that renders the
+ * signature-structure block.
+ */
+function placeholderForField(field: Field): string {
+  const inner = placeholderForType(effectiveTypeTag(field));
+  if (!isOptionalField(field)) {
+    return inner;
+  }
+  // Strip trailing '>' so the optional marker ends up inside the
+  // angle-bracket envelope: '<string (optional)>'.
+  if (inner.startsWith('<') && inner.endsWith('>')) {
+    return `${inner.slice(0, -1)} (optional)>`;
+  }
+  return `${inner} (optional)`;
 }
 
 function formatValue(value: unknown): string {
@@ -112,7 +163,20 @@ function historyFieldName(
 }
 
 function parseFieldValue(field: Field, value: unknown): unknown {
-  switch (field.typeTag) {
+  // Null / undefined on an optional field is a valid "absent" value.
+  // When present, recurse into the inner type so `optional[int]` coerces
+  // a JSON string like "42" to 42, matching the inner-type contract.
+  if (isOptionalField(field)) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    return coerceByTypeTag(effectiveTypeTag(field), value);
+  }
+  return coerceByTypeTag(field.typeTag, value);
+}
+
+function coerceByTypeTag(typeTag: TypeTag, value: unknown): unknown {
+  switch (typeTag) {
     case 'str':
       return typeof value === 'string' ? value : formatValue(value);
     case 'int':
@@ -130,22 +194,75 @@ function parseFieldValue(field: Field, value: unknown): unknown {
     case 'optional':
     case 'union':
     case 'custom':
+    case 'image':
       return snapshotOwnedValue(value);
   }
 }
 
-function assertExactOutputKeys(
+/**
+ * Validate a parsed LM response's output-field key set against the
+ * signature. Semantics:
+ *
+ * - Every required (non-optional) output field must appear in
+ *   `actualKeys`.
+ * - Every key in `actualKeys` must be a declared output field.
+ * - The relative order of `actualKeys` must match declaration order
+ *   (a subsequence, not a prefix). Optional fields that are absent
+ *   do not break ordering; when they *are* present, they must appear
+ *   in their declared position relative to other declared fields.
+ *
+ * The error message quotes the full declared field list (with
+ * required/optional markers) so both humans and the LM's retry can
+ * see what shape was expected.
+ */
+function validateParsedOutputKeys(
   actualKeys: readonly string[],
-  expectedKeys: readonly string[],
+  signature: Signature,
 ): void {
-  if (actualKeys.length !== expectedKeys.length) {
-    throw new ValueError(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
+  const expectedOrder: string[] = [];
+  const optional = new Set<string>();
+  for (const [name, field] of signature.outputFields) {
+    expectedOrder.push(name);
+    if (isOptionalField(field)) {
+      optional.add(name);
+    }
   }
 
-  for (let index = 0; index < expectedKeys.length; index += 1) {
-    if (actualKeys[index] !== expectedKeys[index]) {
-      throw new ValueError(`Expected fields ${expectedKeys.join(', ')}, received ${actualKeys.join(', ')}`);
+  const expectedSet = new Set(expectedOrder);
+  const describe = (): string =>
+    expectedOrder
+      .map((name) => (optional.has(name) ? `${name} (optional)` : name))
+      .join(', ');
+
+  for (const actual of actualKeys) {
+    if (!expectedSet.has(actual)) {
+      throw new ValueError(
+        `Unexpected output field "${actual}". Declared outputs: ${describe()}.`,
+      );
     }
+  }
+
+  const actualSet = new Set(actualKeys);
+  for (const name of expectedOrder) {
+    if (!actualSet.has(name) && !optional.has(name)) {
+      throw new ValueError(
+        `Missing required output field "${name}". Declared outputs: ${describe()}; received: ${actualKeys.join(', ')}.`,
+      );
+    }
+  }
+
+  let cursor = 0;
+  for (const actual of actualKeys) {
+    let advance = cursor;
+    while (advance < expectedOrder.length && expectedOrder[advance] !== actual) {
+      advance += 1;
+    }
+    if (advance >= expectedOrder.length) {
+      throw new ValueError(
+        `Output field "${actual}" is out of declaration order. Declared: ${describe()}; received: ${actualKeys.join(', ')}.`,
+      );
+    }
+    cursor = advance + 1;
   }
 }
 
@@ -205,7 +322,8 @@ function repairJson(candidate: string): string {
   );
 }
 
-function extractFirstJsonObject(source: string): string | null {
+function extractAllJsonObjects(source: string): string[] {
+  const results: string[] = [];
   let start = -1;
   let depth = 0;
   let activeQuote: '"' | "'" | null = null;
@@ -253,24 +371,48 @@ function extractFirstJsonObject(source: string): string | null {
     if (char === '}') {
       depth -= 1;
       if (depth === 0) {
-        return source.slice(start, index + 1);
+        results.push(source.slice(start, index + 1));
+        start = -1;
       }
     }
   }
 
-  return null;
+  return results;
+}
+
+function extractMarkdownJsonBlocks(source: string): string[] {
+  const blocks: string[] = [];
+  const regex = /```(?:json)?\s*([\s\S]*?)\s*```/ig;
+  let match;
+  while ((match = regex.exec(source)) !== null) {
+    if (match[1]) {
+      blocks.push(match[1].trim());
+    }
+  }
+  return blocks;
 }
 
 function parseLooseJsonObject(source: string): Record<string, unknown> | null {
   const candidates = new Set<string>();
+
+  const markdownBlocks = extractMarkdownJsonBlocks(source);
+  for (let i = markdownBlocks.length - 1; i >= 0; i -= 1) {
+    const block = markdownBlocks[i]!;
+    candidates.add(block);
+    const objs = extractAllJsonObjects(block);
+    for (let j = objs.length - 1; j >= 0; j -= 1) {
+      candidates.add(objs[j]!);
+    }
+  }
+
+  const extracted = extractAllJsonObjects(source);
+  for (let i = extracted.length - 1; i >= 0; i -= 1) {
+    candidates.add(extracted[i]!);
+  }
+
   const trimmed = source.trim();
   if (trimmed !== '') {
     candidates.add(trimmed);
-  }
-
-  const extracted = extractFirstJsonObject(source);
-  if (extracted !== null) {
-    candidates.add(extracted);
   }
 
   for (const candidate of candidates) {
@@ -403,6 +545,24 @@ export abstract class Adapter {
     ];
   }
 
+  /**
+   * Returns true iff at least one input field is an `Image` instance.
+   * The adapter uses this to decide between the legacy single-string
+   * user-message path and the multimodal `ContentPart[]` path that
+   * inlines `image_url` parts alongside the marker text.
+   */
+  protected hasImageInput(
+    signature: Signature,
+    inputs: Record<string, unknown>,
+  ): boolean {
+    for (const [name] of signature.inputFields) {
+      if (name in inputs && isImage(inputs[name])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   formatSystemMessage(signature: Signature): string {
     return [
       this.formatFieldDescription(signature),
@@ -430,39 +590,134 @@ export abstract class Adapter {
     return `In adhering to this structure, your objective is: ${signature.instructions}`;
   }
 
+  /**
+   * Build the user-turn content for a single Predict call.
+   *
+   * - If no input field is an `Image`, returns a single trimmed string
+   *   (the historical behavior; preserved verbatim for non-vision flows).
+   * - If at least one input field is an `Image`, returns a frozen
+   *   `ContentPart[]` interleaving text markers and `image_url` parts.
+   *   Images appear immediately after their declaration-order marker,
+   *   matching OpenRouter's "text first, image right after its marker"
+   *   guidance and keeping the existing structured-output parser intact
+   *   (markers like `[[ ## name ## ]]` are preserved as text).
+   *
+   * `options.elideImages` collapses Image inputs into placeholder text
+   * so the string-only path stays usable for demos and conversation
+   * history (where mixing real image bytes into examples blows up
+   * prompt cost without helping the model).
+   */
   formatUserMessageContent(
     signature: Signature,
     inputs: Record<string, unknown>,
     prefix = '',
     suffix = '',
     mainRequest = false,
-  ): string {
-    const parts: string[] = [];
+    options: { readonly elideImages?: boolean } = {},
+  ): string | readonly ContentPart[] {
+    const elideImages = options.elideImages ?? false;
+    const useContentParts = !elideImages && this.hasImageInput(signature, inputs);
 
-    if (prefix.trim() !== '') {
-      parts.push(prefix.trim());
+    if (!useContentParts) {
+      const parts: string[] = [];
+
+      if (prefix.trim() !== '') {
+        parts.push(prefix.trim());
+      }
+
+      for (const [name] of signature.inputFields) {
+        if (name in inputs) {
+          const value = inputs[name];
+          const rendered = isImage(value) ? '<image elided>' : value;
+          parts.push(fieldBlock(name, rendered));
+        }
+      }
+
+      if (mainRequest) {
+        parts.push(this.userMessageOutputRequirements(signature));
+      }
+
+      if (suffix.trim() !== '') {
+        parts.push(suffix.trim());
+      }
+
+      return parts.join('\n\n').trim();
     }
 
+    // Per spec §3.2 / §7.1: emit content parts in three passes —
+    //   1. one consolidated text block with prefix + every non-Image
+    //      input field (in declaration order),
+    //   2. for each Image input (in declaration order), a dedicated
+    //      `text` marker block followed by its `image_url` part so
+    //      images sit immediately after their marker,
+    //   3. a final text block with output requirements + suffix.
+    // The "text first" pass satisfies OpenRouter's preferred ordering;
+    // the per-image marker/image pairing keeps multi-image attribution
+    // unambiguous to the model.
+    const contentParts: ContentPart[] = [];
+    const pushTextIfNonEmpty = (segments: readonly string[]): void => {
+      const joined = segments.join('\n\n').trim();
+      if (joined === '') {
+        return;
+      }
+      contentParts.push(Object.freeze({ type: 'text' as const, text: joined }));
+    };
+
+    const leadingText: string[] = [];
+    if (prefix.trim() !== '') {
+      leadingText.push(prefix.trim());
+    }
     for (const [name] of signature.inputFields) {
-      if (name in inputs) {
-        parts.push(fieldBlock(name, inputs[name]));
+      if (!(name in inputs)) {
+        continue;
+      }
+      const value = inputs[name];
+      if (!isImage(value)) {
+        leadingText.push(fieldBlock(name, value));
       }
     }
+    pushTextIfNonEmpty(leadingText);
 
+    for (const [name] of signature.inputFields) {
+      if (!(name in inputs)) {
+        continue;
+      }
+      const value = inputs[name];
+      if (!isImage(value)) {
+        continue;
+      }
+      contentParts.push(Object.freeze({
+        type: 'text' as const,
+        text: `[[ ## ${name} ## ]]`,
+      }));
+      contentParts.push(Object.freeze({
+        type: 'image_url' as const,
+        image_url: Object.freeze({ url: (value as Image).toDataUri() }),
+      }));
+    }
+
+    const trailingText: string[] = [];
     if (mainRequest) {
-      parts.push(this.userMessageOutputRequirements(signature));
+      trailingText.push(this.userMessageOutputRequirements(signature));
     }
-
     if (suffix.trim() !== '') {
-      parts.push(suffix.trim());
+      trailingText.push(suffix.trim());
     }
+    pushTextIfNonEmpty(trailingText);
 
-    return parts.join('\n\n').trim();
+    return Object.freeze(contentParts);
   }
 
   protected userMessageOutputRequirements(signature: Signature): string {
     const fields = [...signature.outputFields.keys()].map((name) => `\`[[ ## ${name} ## ]]\``);
-    return `Respond with the corresponding output fields, starting with ${fields.join(', then ')}, and then ending with the marker for \`[[ ## completed ## ]]\`.`;
+    const optionalNames = [...signature.outputFields.values()]
+      .filter(isOptionalField)
+      .map((field) => `\`${field.name}\``);
+    const base = `Respond with the corresponding output fields, starting with ${fields.join(', then ')}, and then ending with the marker for \`[[ ## completed ## ]]\`.`;
+    if (optionalNames.length === 0) {
+      return base;
+    }
+    return `${base} ${optionalNames.join(', ')} ${optionalNames.length === 1 ? 'is' : 'are'} optional and may be omitted.`;
   }
 
   formatAssistantMessageContent(
@@ -510,7 +765,14 @@ export abstract class Adapter {
     for (const demo of incomplete) {
       messages.push({
         role: 'user',
-        content: this.formatUserMessageContent(signature, demo, incompletePrefix),
+        content: this.formatUserMessageContent(
+          signature,
+          demo,
+          incompletePrefix,
+          '',
+          false,
+          { elideImages: true },
+        ),
       });
       messages.push({
         role: 'assistant',
@@ -525,7 +787,14 @@ export abstract class Adapter {
     for (const demo of complete) {
       messages.push({
         role: 'user',
-        content: this.formatUserMessageContent(signature, demo),
+        content: this.formatUserMessageContent(
+          signature,
+          demo,
+          '',
+          '',
+          false,
+          { elideImages: true },
+        ),
       });
       messages.push({
         role: 'assistant',
@@ -558,7 +827,14 @@ export abstract class Adapter {
     for (const entry of history.messages) {
       messages.push({
         role: 'user',
-        content: this.formatUserMessageContent(signature, entry),
+        content: this.formatUserMessageContent(
+          signature,
+          entry,
+          '',
+          '',
+          false,
+          { elideImages: true },
+        ),
       });
       messages.push({
         role: 'assistant',
@@ -712,8 +988,8 @@ export class ChatAdapter extends Adapter {
   override formatFieldStructure(signature: Signature): string {
     const parts = [
       'All interactions will be structured in the following way, with the appropriate values filled in.',
-      ...[...signature.inputFields.values()].map((field) => fieldBlock(field.name, placeholderForType(field.typeTag))),
-      ...[...signature.outputFields.values()].map((field) => fieldBlock(field.name, placeholderForType(field.typeTag))),
+      ...[...signature.inputFields.values()].map((field) => fieldBlock(field.name, placeholderForField(field))),
+      ...[...signature.outputFields.values()].map((field) => fieldBlock(field.name, placeholderForField(field))),
       '[[ ## completed ## ]]',
     ];
 
@@ -722,7 +998,6 @@ export class ChatAdapter extends Adapter {
 
   override parse(signature: Signature, completion: string): Record<string, unknown> {
     const sections = new Map<string, string>();
-    const expectedKeys = [...signature.outputFields.keys()];
 
     let currentHeader: string | null = null;
     let currentLines: string[] = [];
@@ -760,7 +1035,7 @@ export class ChatAdapter extends Adapter {
 
     const actualKeys = [...sections.keys()];
     try {
-      assertExactOutputKeys(actualKeys, expectedKeys);
+      validateParsedOutputKeys(actualKeys, signature);
     } catch (error) {
       throw new AdapterParseError({
         adapterName: 'ChatAdapter',
@@ -800,13 +1075,13 @@ export class JSONAdapter extends ChatAdapter {
 
   override formatFieldStructure(signature: Signature): string {
     const inputBlocks = [...signature.inputFields.values()].map((field) => (
-      fieldBlock(field.name, placeholderForType(field.typeTag))
+      fieldBlock(field.name, placeholderForField(field))
     ));
 
     const outputShape = Object.fromEntries(
       [...signature.outputFields.values()].map((field) => [
         field.name,
-        placeholderForType(field.typeTag),
+        placeholderForField(field),
       ]),
     );
 
@@ -821,7 +1096,14 @@ export class JSONAdapter extends ChatAdapter {
 
   protected override userMessageOutputRequirements(signature: Signature): string {
     const fields = [...signature.outputFields.keys()].map((name) => `\`${name}\``);
-    return `Respond with a JSON object in the following order of fields: ${fields.join(', then ')}.`;
+    const optionalNames = [...signature.outputFields.values()]
+      .filter(isOptionalField)
+      .map((field) => `\`${field.name}\``);
+    const base = `Respond with a JSON object in the following order of fields: ${fields.join(', then ')}.`;
+    if (optionalNames.length === 0) {
+      return base;
+    }
+    return `${base} ${optionalNames.join(', ')} ${optionalNames.length === 1 ? 'is' : 'are'} optional and may be omitted.`;
   }
 
   override formatAssistantMessageContent(
@@ -871,10 +1153,9 @@ export class JSONAdapter extends ChatAdapter {
     }
 
     const actualKeys = Object.keys(filtered);
-    const expectedKeys = [...signature.outputFields.keys()];
 
     try {
-      assertExactOutputKeys(actualKeys, expectedKeys);
+      validateParsedOutputKeys(actualKeys, signature);
     } catch (error) {
       throw new AdapterParseError({
         adapterName: 'JSONAdapter',

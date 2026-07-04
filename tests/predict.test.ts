@@ -327,7 +327,7 @@ describe('Predict hardening', () => {
           },
         },
       },
-    })).toThrow('Expected fields answer');
+    })).toThrow('Missing required output field "answer"');
     expect(lm.calls).toHaveLength(1);
   });
 });

@@ -6,9 +6,11 @@
  * so that all registrations happen exactly once.
  */
 
+import { minimaxAiHubProfile } from './minimaxai_hub.js';
 import { openRouterMinimaxProfile } from './openrouter_minimax.js';
 import { registerProfile } from './profile.js';
 
 export { registerProfile, resolveProfile } from './profile.js';
 
+registerProfile(minimaxAiHubProfile);
 registerProfile(openRouterMinimaxProfile);

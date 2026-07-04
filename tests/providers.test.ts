@@ -11,6 +11,7 @@ import {
   type Message,
   type ProviderProfile,
 } from '../src/index.js';
+import { minimaxAiHubProfile } from '../src/providers/minimaxai_hub.js';
 import { openRouterMinimaxProfile } from '../src/providers/openrouter_minimax.js';
 import { clearProfiles } from '../src/providers/profile.js';
 
@@ -70,6 +71,7 @@ function singleOutputSignature() {
 describe('Provider profile registry', () => {
   beforeEach(() => {
     clearProfiles();
+    registerProfile(minimaxAiHubProfile);
     registerProfile(openRouterMinimaxProfile);
   });
 
@@ -86,6 +88,12 @@ describe('Provider profile registry', () => {
     const profile = resolveProfile('openrouter/minimax/minimax-m2.7');
     expect(profile).not.toBeNull();
     expect(profile?.id).toBe('openrouter-minimax');
+  });
+
+  it('resolves the MiniMax AI Hub profile for MiniMaxAI/* model ids', () => {
+    const profile = resolveProfile('MiniMaxAI/MiniMax-M2.7');
+    expect(profile).not.toBeNull();
+    expect(profile?.id).toBe('minimax-ai-hub');
   });
 
   it('rejects duplicate registrations with a clear error', () => {
@@ -175,7 +183,7 @@ describe('Provider profile dispatch through core modules', () => {
     const adapter = new JSONAdapter();
 
     expect(() => adapter.call(lm, {}, singleOutputSignature(), [], { question: 'Why?' }))
-      .toThrow(/Expected fields answer/);
+      .toThrow(/Missing required output field "answer"/);
     expect(lm.calls).toHaveLength(1);
   });
 
@@ -184,7 +192,7 @@ describe('Provider profile dispatch through core modules', () => {
     const adapter = new JSONAdapter();
 
     expect(() => adapter.call(lm, {}, singleOutputSignature(), [], { question: 'Why?' }))
-      .toThrow(/Expected fields answer/);
+      .toThrow(/Missing required output field "answer"/);
     expect(lm.calls).toHaveLength(1);
   });
 

@@ -7,14 +7,27 @@
  * Usage:
  *   pnpm run bench:longcot -- --domain logic --difficulty easy --max 2
  *
- *   If `HF_TOKEN` is unset, the runner loads repo-root `.env` (same directory as
- *   `package.json`). Explicit environment variables always win.
+ *   If `HF_TOKEN` / Together API keys are unset, the runner loads repo-root `.env`
+ *   (same directory as `package.json`). Explicit environment variables always win.
+ *
+ *   When `TOGETHER_API_KEY` (or `TOGETHERAI_API_KEY`) is set, requests go **directly**
+ *   to Together's OpenAI-compatible API — same contract as
+ *   `new OpenAI({ apiKey, baseURL: "https://api.together.xyz/v1" })` — bypassing the
+ *   Hugging Face router (helps avoid HF gateway 504s on long runs).
+ *   Set `LONGCOT_LM_BACKEND=huggingface` to force HF even if a Together key exists.
+ *   On the HF backend, `LM` uses **SSE streaming** by default (`stream: true`) so long
+ *   generations are less likely to hit idle **504** timeouts; override with `LONGCOT_STREAM=0`.
+ *
+ *   **Fireworks (Fire Pass / serverless):** `FIREWORKS_API_KEY` with
+ *   `LONGCOT_LM_BACKEND=fireworks` uses the OpenAI-compatible endpoint
+ *   `https://api.fireworks.ai/inference/v1` (see https://docs.fireworks.ai/firepass).
+ *   Default model: `accounts/fireworks/routers/kimi-k2p5-turbo` (Fire Pass Kimi K2.5 Turbo).
  *
  *   # Export + score only (no API calls; responses are empty — expect 0 accuracy)
  *   pnpm run bench:longcot -- --dry-run --max 1
  *
  * Cost safety (use in order):
- *   1. --preflight     One tiny HF chat completion (~tens of tokens); no LongCoT / RLM.
+ *   1. --preflight     One tiny chat completion (~tens of tokens); no LongCoT / RLM.
  *   2. --smoke         One LongCoT question with hard caps (summarise, ≤48 oracle calls, ≤8k completion tokens).
  *   3. Larger runs      Require --i-accept-cost when --max > 20, completion tokens > 50k, or oracle cap > 500.
  */
@@ -26,8 +39,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { LMOutput } from '../src/lm.js';
 import {
+  ChatAdapter,
   LM,
-  Predict,
   RLM,
   isTaskType,
   settings,
@@ -35,9 +48,71 @@ import {
 } from '../src/index.js';
 
 type BenchRunner = 'rlm' | 'predict';
+type BenchLmBackend = 'together' | 'huggingface' | 'fireworks';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
 const LONGCOT_DIR = resolve(REPO_ROOT, 'tools', 'longcot');
+
+/**
+ * Together OpenAI-compatible baseURL (same as the official `openai` npm package and
+ * Together's docs: Bearer token + `/v1/chat/completions`).
+ */
+const TOGETHER_OPENAI_BASE = 'https://api.together.xyz/v1';
+const DEFAULT_TOGETHER_MODEL = 'MiniMaxAI/MiniMax-M2.7';
+const DEFAULT_HF_MODEL = 'MiniMaxAI/MiniMax-M2.7:together';
+
+/** Fireworks OpenAI-compatible API (chat completions). @see https://docs.fireworks.ai/firepass */
+const FIREWORKS_OPENAI_BASE = 'https://api.fireworks.ai/inference/v1';
+/** Fire Pass / docs default for Kimi K2.5 Turbo router */
+const DEFAULT_FIREWORKS_MODEL = 'accounts/fireworks/routers/kimi-k2p5-turbo';
+
+function togetherApiKey(): string | undefined {
+  return process.env.TOGETHER_API_KEY ?? process.env.TOGETHERAI_API_KEY;
+}
+
+function fireworksApiKey(): string | undefined {
+  return process.env.FIREWORKS_API_KEY;
+}
+
+function fireworksOpenAiBaseUrl(): string {
+  const raw = process.env.FIREWORKS_API_BASE ?? FIREWORKS_OPENAI_BASE;
+  return raw.replace(/\/$/, '');
+}
+
+/**
+ * Streaming keeps long generations alive through gateways that time out idle HTTP connections.
+ * Default: on for Hugging Face router only; set LONGCOT_STREAM=1 for all backends or 0 to disable.
+ */
+function resolveLongcotStream(backend: BenchLmBackend): boolean {
+  const v = process.env.LONGCOT_STREAM?.trim().toLowerCase();
+  if (v === '0' || v === 'false' || v === 'off') {
+    return false;
+  }
+  if (v === '1' || v === 'true' || v === 'on') {
+    return true;
+  }
+  return backend === 'huggingface' || backend === 'fireworks';
+}
+
+function resolveLmBackend(): BenchLmBackend {
+  const override = process.env.LONGCOT_LM_BACKEND?.toLowerCase();
+  if (override === 'huggingface' || override === 'hf') {
+    return 'huggingface';
+  }
+  if (override === 'together') {
+    return 'together';
+  }
+  if (override === 'fireworks' || override === 'fw') {
+    return 'fireworks';
+  }
+  if (togetherApiKey()) {
+    return 'together';
+  }
+  if (fireworksApiKey()) {
+    return 'fireworks';
+  }
+  return 'huggingface';
+}
 
 /**
  * Minimal `.env` loader (no dependency on `dotenv`). Does not override existing
@@ -99,16 +174,36 @@ interface CliOptions {
   readonly maxCompletionTokens: number;
   readonly outDir: string;
   readonly maxOracleCalls: number;
+  readonly maxEffectTurns: number;
   /** Extra-aggressive caps for a single cheap end-to-end probe */
   readonly smoke: boolean;
   /**
-   * `predict` — plain `prompt -> answer` (matches LongCoT free-text `solution = …`).
-   * `rlm` — full RLM v2 (oracle leaves expect structured effect-oracle JSON from the LM).
+   * `predict` — raw `LM.acall(prompt)` (LongCoT free-text `solution = …`, not JSON).
+   * `rlm` — full RLM v2 (uses `ChatAdapter` so final `answer` is natural language for `verify()`).
    */
   readonly runner: BenchRunner;
   /** True when `--runner` was passed; `--smoke` only overrides runner when this is false. */
   readonly runnerFromCli: boolean;
+  /** True when `--model` was explicitly passed. */
+  readonly modelFromCli: boolean;
+  /** True when `--api-base` was explicitly passed (any backend). */
+  readonly apiBaseFromCli: boolean;
+  /** True when `--task-type` was explicitly passed (disables domain-based auto-selection). */
+  readonly taskTypeFromCli: boolean;
 }
+
+/**
+ * Domains whose LongCoT questions are sequential state-tracking puzzles
+ * (BlocksWorld, Sudoku, Dungeon, chess move sequences, stateful CS
+ * problems). These MUST route to the `solve` task type because every
+ * chunking/fan-out plan (search / aggregate / summarise / multi_hop)
+ * destroys sequential state by splitting the prompt.
+ */
+const STATE_TRACKING_DOMAINS: ReadonlySet<string> = new Set([
+  'logic',
+  'chess',
+  'cs',
+]);
 
 /** Reasoning-heavy models (e.g. MiniMax on HF) may need room for `reasoning_content` plus answer text per oracle call. */
 const SMOKE_MAX_COMPLETION_TOKENS = 8192;
@@ -125,7 +220,11 @@ function applySmokeCaps(opts: CliOptions): CliOptions {
   return {
     ...opts,
     max: 1,
-    taskType: 'summarise',
+    // Smoke inherits the already-resolved taskType (e.g. `solve` for
+    // state-tracking domains) unless the caller pinned one explicitly.
+    // This used to force `summarise`, which is catastrophic for
+    // BlocksWorld-style puzzles; the bench no longer overrides it.
+    taskType: opts.taskTypeFromCli ? opts.taskType : opts.taskType,
     maxCompletionTokens: Math.min(opts.maxCompletionTokens, SMOKE_MAX_COMPLETION_TOKENS),
     maxOracleCalls: Math.min(opts.maxOracleCalls, SMOKE_MAX_ORACLE_CALLS),
     noFallbackScore: true,
@@ -143,23 +242,21 @@ function isExpensiveRun(opts: CliOptions): boolean {
   );
 }
 
-async function runPreflight(model: string, apiBase: string): Promise<void> {
-  const hfToken = process.env.HF_TOKEN;
-  if (!hfToken) {
-    console.error(
-      'Missing HF_TOKEN. Add it to .env in the repo root, export it, or pass --dry-run on the full bench.',
-    );
-    process.exit(1);
-  }
-
+async function runPreflight(
+  model: string,
+  apiBase: string,
+  apiKey: string,
+  useStream: boolean,
+): Promise<void> {
   const lm = new LM({
     model,
-    apiKey: hfToken,
+    apiKey,
     apiBase,
     kwargs: {
       // Reasoning models (e.g. MiniMax on HF) may spend the first chunk of the
       // budget in `reasoning_content`; keep this high enough for a visible answer.
       max_completion_tokens: 512,
+      ...(useStream ? { stream: true as const } : {}),
     },
   });
 
@@ -183,7 +280,8 @@ async function runPreflight(model: string, apiBase: string): Promise<void> {
 
   if (text.length === 0) {
     console.error(
-      'preflight failed: empty completion. Check HF model id, HF_TOKEN, and that the router returns message.content as a string.',
+      'preflight failed: empty completion. Check model id and API key; for MiniMax-style models ensure '
+        + 'the provider returns non-empty message.content or reasoning fields (see src/lm.ts).',
     );
     process.exit(1);
   }
@@ -198,14 +296,18 @@ function parseArgs(argv: string[]): CliOptions {
   let domain = 'logic';
   let difficulty = 'easy';
   let max = 1;
-  let taskType: TaskType = 'multi_hop';
+  let taskType: TaskType = 'solve';
+  let taskTypeFromCli = false;
   let dryRun = false;
   let noFallbackScore = false;
-  let model = process.env.HF_MODEL ?? 'MiniMaxAI/MiniMax-M2.7:novita';
+  let model = process.env.HF_MODEL ?? DEFAULT_HF_MODEL;
   let apiBase = process.env.HF_API_BASE ?? 'https://router.huggingface.co/v1';
+  let modelFromCli = false;
+  let apiBaseFromCli = false;
   let maxCompletionTokens = Number(process.env.LONGCOT_MAX_COMPLETION_TOKENS ?? 16384);
   let outDir = resolve(REPO_ROOT, 'tools', 'longcot', 'runs');
   let maxOracleCalls = Number(process.env.LONGCOT_RLM_MAX_ORACLE_CALLS ?? 400);
+  let maxEffectTurns = Number(process.env.LONGCOT_RLM_MAX_EFFECT_TURNS ?? 64);
   let smoke = false;
   let runner: BenchRunner = 'rlm';
   let runnerFromCli = false;
@@ -222,10 +324,13 @@ function parseArgs(argv: string[]): CliOptions {
       const t = argv[++i]!;
       if (!isTaskType(t)) {
         throw new Error(
-          `Invalid --task-type ${t}. Expected one of: search, classify, aggregate, pairwise, summarise, multi_hop, unknown`,
+          `Invalid --task-type ${t}. Expected one of: search, classify, aggregate, pairwise, summarise, multi_hop, solve, unknown`,
         );
       }
       taskType = t;
+      taskTypeFromCli = true;
+    } else if (a === '--max-effect-turns' && argv[i + 1]) {
+      maxEffectTurns = Math.max(1, Number(argv[++i]!));
     } else if (a === '--dry-run') {
       dryRun = true;
     } else if (a === '--smoke') {
@@ -234,8 +339,10 @@ function parseArgs(argv: string[]): CliOptions {
       noFallbackScore = true;
     } else if (a === '--model' && argv[i + 1]) {
       model = argv[++i]!;
+      modelFromCli = true;
     } else if (a === '--api-base' && argv[i + 1]) {
       apiBase = argv[++i]!;
+      apiBaseFromCli = true;
     } else if (a === '--max-completion-tokens' && argv[i + 1]) {
       maxCompletionTokens = Math.max(1, Number(argv[++i]!));
     } else if (a === '--out-dir' && argv[i + 1]) {
@@ -253,14 +360,24 @@ function parseArgs(argv: string[]): CliOptions {
       console.log(`bench_longcot_rlm.ts
 
 Environment:
-  HF_TOKEN              Hugging Face API token (required unless --dry-run)
-  HF_MODEL              Default: MiniMaxAI/MiniMax-M2.7:novita
+  HF_TOKEN              Hugging Face API token (required for HF backend unless --dry-run)
+  TOGETHER_API_KEY      Together API key (OpenAI-compat; if set, bench uses baseURL ${TOGETHER_OPENAI_BASE})
+                        Also accepts TOGETHERAI_API_KEY. Override with LONGCOT_LM_BACKEND=huggingface.
+  TOGETHER_MODEL        When using Together backend: default model id (${DEFAULT_TOGETHER_MODEL})
+  FIREWORKS_API_KEY     Fireworks API key — use with LONGCOT_LM_BACKEND=fireworks (OpenAI base ${FIREWORKS_OPENAI_BASE})
+  FIREWORKS_MODEL       Default when using Fireworks backend: ${DEFAULT_FIREWORKS_MODEL}
+  FIREWORKS_API_BASE    Override Fireworks OpenAI base (default: ${FIREWORKS_OPENAI_BASE})
+  LONGCOT_LM_BACKEND    together | huggingface | fireworks (aliases: hf, fw)
+                        Default: together if TOGETHER_API_KEY set; else fireworks if FIREWORKS_API_KEY set; else huggingface
+  HF_MODEL              Default on HF backend: ${DEFAULT_HF_MODEL}
   HF_API_BASE           Default: https://router.huggingface.co/v1
   LONGCOT_MAX_COMPLETION_TOKENS  Default: 16384
   LONGCOT_RLM_MAX_ORACLE_CALLS   Default: 400
+  LONGCOT_STREAM        1|true|on = force SSE streaming for all backends; 0|false|off = disable.
+                        When unset: streaming is enabled only for huggingface (mitigates router 504).
 
 Cost safety:
-  --preflight           One tiny HF completion only (no LongCoT / RLM). Run this first.
+  --preflight           One tiny chat completion only (provider per LONGCOT_LM_BACKEND / keys).
   --smoke               One question with tight caps + --no-fallback-score. Defaults to --runner predict
                         (LongCoT wants free-text "solution = …"). Use --smoke --runner rlm only if the LM
                         reliably emits RLM effect-oracle JSON.
@@ -286,6 +403,13 @@ Flags:
     }
   }
 
+  // Domain-based auto-routing: state-tracking puzzle domains must NOT
+  // use chunking plans; route them to `solve` unless the caller pinned
+  // `--task-type` explicitly.
+  if (!taskTypeFromCli && STATE_TRACKING_DOMAINS.has(domain)) {
+    taskType = 'solve';
+  }
+
   return {
     domain,
     difficulty,
@@ -298,9 +422,13 @@ Flags:
     maxCompletionTokens,
     outDir,
     maxOracleCalls,
+    maxEffectTurns,
     smoke,
     runner,
     runnerFromCli,
+    modelFromCli,
+    apiBaseFromCli,
+    taskTypeFromCli,
   };
 }
 
@@ -365,18 +493,69 @@ async function main(): Promise<void> {
     );
   }
 
+  const lmBackend = resolveLmBackend();
+  if (lmBackend === 'together' && !opts.modelFromCli) {
+    opts = {
+      ...opts,
+      model: process.env.TOGETHER_MODEL ?? DEFAULT_TOGETHER_MODEL,
+    };
+  }
+
+  if (lmBackend === 'fireworks' && !opts.modelFromCli) {
+    opts = {
+      ...opts,
+      model: process.env.FIREWORKS_MODEL ?? DEFAULT_FIREWORKS_MODEL,
+    };
+  }
+
   if (wantsPreflight) {
-    if (!process.env.HF_TOKEN) {
-      console.error(
-        'Missing HF_TOKEN. Add it to .env in the repo root or export it before --preflight.',
-      );
-      process.exit(1);
+    const useStream = resolveLongcotStream(lmBackend);
+    if (lmBackend === 'together') {
+      const key = togetherApiKey();
+      if (!key) {
+        console.error(
+          'Missing TOGETHER_API_KEY (or TOGETHERAI_API_KEY). Add it to .env or export it before --preflight.',
+        );
+        process.exit(1);
+      }
+      await runPreflight(opts.model, TOGETHER_OPENAI_BASE, key, useStream);
+    } else if (lmBackend === 'fireworks') {
+      const key = fireworksApiKey();
+      if (!key) {
+        console.error(
+          'Missing FIREWORKS_API_KEY. Add it to .env or export it before --preflight.',
+        );
+        process.exit(1);
+      }
+      const base = opts.apiBaseFromCli ? opts.apiBase : fireworksOpenAiBaseUrl();
+      await runPreflight(opts.model, base, key, useStream);
+    } else {
+      if (!process.env.HF_TOKEN) {
+        console.error(
+          'Missing HF_TOKEN. Add it to .env in the repo root or export it before --preflight.',
+        );
+        process.exit(1);
+      }
+      await runPreflight(opts.model, opts.apiBase, process.env.HF_TOKEN, useStream);
     }
-    await runPreflight(opts.model, opts.apiBase);
     return;
   }
 
-  if (!opts.dryRun && !process.env.HF_TOKEN) {
+  if (!opts.dryRun && lmBackend === 'together' && !togetherApiKey()) {
+    console.error(
+      'Missing TOGETHER_API_KEY (or TOGETHERAI_API_KEY). Add it to .env, export it, or pass --dry-run.',
+    );
+    process.exit(1);
+  }
+
+  if (!opts.dryRun && lmBackend === 'fireworks' && !fireworksApiKey()) {
+    console.error(
+      'Missing FIREWORKS_API_KEY. Add it to .env, export it, or pass --dry-run.',
+    );
+    process.exit(1);
+  }
+
+  if (!opts.dryRun && lmBackend === 'huggingface' && !process.env.HF_TOKEN) {
     console.error(
       'Missing HF_TOKEN. Add it to .env in the repo root, export it, or pass --dry-run.',
     );
@@ -407,37 +586,55 @@ async function main(): Promise<void> {
   console.error(`Exported ${String(questions.length)} question(s) → ${responsesPath}`);
 
   if (!opts.dryRun) {
-    const hfToken = process.env.HF_TOKEN;
-    if (!hfToken) {
-      throw new Error('HF_TOKEN disappeared after loadRootEnvFile (internal error)');
-    }
+    const fireworksBase = opts.apiBaseFromCli ? opts.apiBase : fireworksOpenAiBaseUrl();
+    const lmOpts =
+      lmBackend === 'together'
+        ? {
+            model: opts.model,
+            apiKey: togetherApiKey()!,
+            apiBase: TOGETHER_OPENAI_BASE,
+          }
+        : lmBackend === 'fireworks'
+          ? {
+              model: opts.model,
+              apiKey: fireworksApiKey()!,
+              apiBase: fireworksBase,
+            }
+          : {
+              model: opts.model,
+              apiKey: process.env.HF_TOKEN!,
+              apiBase: opts.apiBase,
+            };
+    const useStream = resolveLongcotStream(lmBackend);
     settings.configure({
       lm: new LM({
-        model: opts.model,
-        apiKey: hfToken,
-        apiBase: opts.apiBase,
+        ...lmOpts,
         kwargs: {
-          max_completion_tokens: opts.maxCompletionTokens,
+          max_tokens: opts.maxCompletionTokens,
+          ...(useStream ? { stream: true as const } : {}),
         },
       }),
     });
+    console.error(
+      `[bench:longcot] lmBackend=${lmBackend} stream=${useStream ? 'on' : 'off'} (LONGCOT_STREAM)`,
+    );
   }
 
-  const predictor =
-    !opts.dryRun && opts.runner === 'predict'
-      ? new Predict('prompt: str -> answer: str')
-      : null;
   const rlm =
     !opts.dryRun && opts.runner === 'rlm'
       ? new RLM('prompt: str -> answer: str', {
           taskType: opts.taskType,
           budget: {
             maxOracleCalls: opts.maxOracleCalls,
+            maxEffectTurns: opts.maxEffectTurns,
           },
         })
       : null;
 
-  console.error(`[bench:longcot] runner=${opts.runner}`);
+  console.error(
+    `[bench:longcot] runner=${opts.runner}` +
+      (opts.runner === 'rlm' && !opts.dryRun ? ' (RLM uses ChatAdapter during aforward for verify()-friendly text)' : ''),
+  );
 
   const out = createWriteStream(responsesPath, { flags: 'w' });
 
@@ -455,14 +652,29 @@ async function main(): Promise<void> {
     } else {
       const t0 = Date.now();
       try {
-        if (predictor !== null) {
-          const pred = await predictor.aforward({ prompt: q.prompt });
-          row.response_text = pred.getOr('answer', '');
+        if (opts.runner === 'predict') {
+          const lm = settings.lm;
+          if (lm === null) {
+            row.error = 'internal: settings.lm is not configured';
+          } else {
+            const outputs = await (lm as LM).acall(q.prompt);
+            row.response_text = lmOutputText(outputs[0]);
+          }
         } else if (rlm !== null) {
-          const pred = await rlm.aforward({ prompt: q.prompt });
-          row.response_text = pred.getOr('answer', '');
+          const rlmT0 = Date.now();
+          console.log(`[LM] Starting RLM inference for ${q.question_id}...`);
+          try {
+            const pred = await settings.context({ adapter: new ChatAdapter() }, async () =>
+              rlm.aforward({ prompt: q.prompt }),
+            );
+            console.log(`[LM] RLM inference finished in ${Date.now() - rlmT0}ms.`);
+            row.response_text = String(pred.getOr('answer', '') ?? '');
+          } catch (e: any) {
+            console.error(`[LM] RLM inference failed after ${Date.now() - rlmT0}ms: ${e.message}`);
+            row.error = e.message;
+          }
         } else {
-          row.error = 'internal: no predictor or rlm';
+          row.error = 'internal: no RLM (unexpected runner)';
         }
         row.latency_ms = Date.now() - t0;
       } catch (e) {

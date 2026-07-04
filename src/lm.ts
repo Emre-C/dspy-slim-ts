@@ -11,6 +11,7 @@ import type { HistoryEntry } from './history_entry.js';
 import { isPlainObject } from './guards.js';
 import type { LMOutput, LMOutputEnvelope, ToolCallWire } from './lm_output.js';
 import { snapshotOwnedValue, snapshotRecord } from './owned_value.js';
+import { aggregateOpenAiChatCompletionStream } from './lm_streaming.js';
 import { resolveProfile } from './providers/index.js';
 import { providerModelName, providerNameFromModel } from './providers/model_id.js';
 import { settings } from './settings.js';
@@ -21,6 +22,24 @@ export type { LMOutput, LMOutputEnvelope, ToolCallWire } from './lm_output.js';
 
 const GLOBAL_HISTORY_MAX_SIZE = 10_000;
 const REASONING_MODEL_PATTERN = /^(?:o[1345](?:-(?:mini|nano|pro))?(?:-\d{4}-\d{2}-\d{2})?|gpt-5(?!-chat)(?:-.*)?)$/;
+
+/** Vision allowlist from `DSPY_SLIM_VISION_SPEC.md` §4.2. */
+const VISION_MODEL_PATTERNS: readonly RegExp[] = [
+  /^openrouter\/google\/gemini-(?:3|2\.5|2\.0|1\.5)(?:-|$)/,
+  /^openrouter\/anthropic\/claude-3(?:-|$)/,
+  /^openrouter\/anthropic\/claude-(?:sonnet|opus)(?:-|$)/,
+  /^openrouter\/openai\/gpt-4o(?:-|$)/,
+  /^openrouter\/openai\/gpt-4-turbo(?:-|$)/,
+  /^openrouter\/openai\/gpt-4-vision(?:-|$)/,
+  /^openai\/gpt-4o(?:-|$)/,
+  /^openai\/gpt-4-turbo(?:-|$)/,
+  /^openai\/gpt-4-vision(?:-|$)/,
+];
+
+function modelMatchesVisionPattern(model: string): boolean {
+  const lower = model.toLowerCase();
+  return VISION_MODEL_PATTERNS.some((pattern) => pattern.test(lower));
+}
 const RESPONSE_FORMAT_PARAMS = Object.freeze(new Set(['response_format']));
 const RETRYABLE_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 const RETRYABLE_ERROR_CODES = new Set(['rate_limit_exceeded', 'server_error', 'temporarily_unavailable']);
@@ -36,6 +55,12 @@ export interface BaseLMOptions {
 interface ChatCompletionChoice {
   readonly message?: {
     readonly content?: string | null;
+    /**
+     * OpenAI-compatible reasoning models (e.g. Together MiniMax M2.7, DeepSeek-R1)
+     * may leave `content` null while populating a side channel.
+     */
+    readonly reasoning?: string | null;
+    readonly reasoning_content?: string | null;
     readonly refusal?: string | null;
     readonly tool_calls?: readonly ToolCallWire[];
     readonly provider_specific_fields?: {
@@ -86,6 +111,13 @@ export interface LMOptions extends BaseLMOptions {
   readonly useDeveloperRole?: boolean;
   readonly callbacks?: readonly Callback[] | undefined;
   readonly fetch?: typeof globalThis.fetch | undefined;
+  /**
+   * Override the vision-capability detection. When `true`, the LM
+   * unconditionally reports `supportsVision === true`; when `false`,
+   * `supportsVision === false`. Leave undefined to use the built-in
+   * model-name heuristic (`VISION_MODEL_PATTERNS`).
+   */
+  readonly forceVisionCapable?: boolean | undefined;
 }
 
 interface TransportOptions {
@@ -203,15 +235,45 @@ function stringifyAssistantContent(content: unknown): string {
   return '';
 }
 
+/** Prefer `content`; if empty, use reasoning side channels (MiniMax, DeepSeek-style APIs). */
+function assistantTurnVisibleText(choice: ChatCompletionChoice): string {
+  const message = choice.message;
+  if (message === undefined) {
+    return typeof choice.text === 'string' ? choice.text : '';
+  }
+
+  const fromContent = stringifyAssistantContent(message.content as unknown);
+  if (fromContent !== '') {
+    return fromContent;
+  }
+
+  const fromReasoningContent = stringifyAssistantContent(
+    (message as { readonly reasoning_content?: unknown }).reasoning_content,
+  );
+  if (fromReasoningContent !== '') {
+    return fromReasoningContent;
+  }
+
+  const fromReasoning = stringifyAssistantContent(
+    (message as { readonly reasoning?: unknown }).reasoning,
+  );
+  if (fromReasoning !== '') {
+    return fromReasoning;
+  }
+
+  if (typeof message.refusal === 'string' && message.refusal !== '') {
+    return message.refusal;
+  }
+
+  return typeof choice.text === 'string' ? choice.text : '';
+}
+
 function processChatCompletion(
   response: ChatCompletionResponse,
   mergedKwargs: Record<string, unknown>,
 ): readonly LMOutput[] {
   const outputs = response.choices.map((choice) => {
-    const text =
-      stringifyAssistantContent(choice.message?.content as unknown)
-      || (typeof choice.message?.refusal === 'string' ? choice.message.refusal : '')
-      || (typeof choice.text === 'string' ? choice.text : '');
+    const text = assistantTurnVisibleText(choice);
     const citations = flattenCitations(choice.message?.provider_specific_fields?.citations);
     const envelope: LMOutputEnvelope = {
       text,
@@ -534,6 +596,17 @@ function buildTransportOptions(
   };
 }
 
+function openAiCompatRequestHeaders(options: TransportOptions): Record<string, string> {
+  return {
+    Authorization: `Bearer ${options.apiKey}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'dspy-slim-ts/0.1.0',
+    ...(options.organization ? { 'OpenAI-Organization': options.organization } : {}),
+    ...(options.project ? { 'OpenAI-Project': options.project } : {}),
+    ...options.headers,
+  };
+}
+
 async function runAsyncRequest(
   url: string,
   body: Record<string, unknown>,
@@ -542,16 +615,51 @@ async function runAsyncRequest(
 ): Promise<unknown> {
   const response = await fetchImpl(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${options.apiKey}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'dspy-slim-ts/0.1.0',
-      ...(options.organization ? { 'OpenAI-Organization': options.organization } : {}),
-      ...(options.project ? { 'OpenAI-Project': options.project } : {}),
-      ...options.headers,
-    },
+    headers: openAiCompatRequestHeaders(options),
     body: JSON.stringify(body),
   });
+
+  const errorBodyFromText = async (): Promise<unknown> => {
+    const text = await response.text();
+    return text.trim() === '' ? {} : (() => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    })();
+  };
+
+  if (!response.ok) {
+    const parsed = await errorBodyFromText();
+    throw new OpenAIRequestError(errorMessageFromBody(parsed), {
+      status: response.status,
+      code: errorCodeFromBody(parsed),
+      body: parsed,
+    });
+  }
+
+  const streamChatCompletions = body.stream === true && url.endsWith('/chat/completions');
+  if (streamChatCompletions) {
+    if (response.body === null) {
+      throw new OpenAIRequestError('Streaming chat completion response has no body', {
+        status: response.status,
+        body: null,
+      });
+    }
+    const modelName = typeof body.model === 'string' ? body.model : '';
+    try {
+      return await aggregateOpenAiChatCompletionStream(response.body, modelName);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new OpenAIRequestError(
+        message.startsWith('OpenAI-compatible')
+          ? message
+          : `OpenAI-compatible streaming failed: ${message}`,
+        { status: response.status, body: null },
+      );
+    }
+  }
 
   const text = await response.text();
   const parsed = text.trim() === '' ? {} : (() => {
@@ -561,14 +669,6 @@ async function runAsyncRequest(
       return text;
     }
   })();
-
-  if (!response.ok) {
-    throw new OpenAIRequestError(errorMessageFromBody(parsed), {
-      status: response.status,
-      code: errorCodeFromBody(parsed),
-      body: parsed,
-    });
-  }
 
   return parsed;
 }
@@ -622,6 +722,18 @@ export abstract class BaseLM {
   }
 
   get supportsResponseSchema(): boolean {
+    return false;
+  }
+
+  /**
+   * Whether this LM accepts multimodal `image_url` content parts in
+   * user messages. Defaults to `false`; concrete subclasses with vision
+   * capability override and/or honor an explicit `forceVisionCapable`
+   * flag at construction time. Adapters and `Predict` consult this to
+   * reject Image-bearing signatures on text-only LMs early instead of
+   * silently dropping image bytes.
+   */
+  get supportsVision(): boolean {
     return false;
   }
 
@@ -692,6 +804,18 @@ export abstract class BaseLM {
         return this.processAndRecordResponse(response, prompt, messages, kwargs);
       },
     });
+  }
+
+  async acompletion(args: {
+    readonly messages: readonly Message[];
+    readonly kwargs?: Record<string, unknown>;
+  }): Promise<string> {
+    const outputs = await this.acall(undefined, args.messages, args.kwargs);
+    const first = outputs[0];
+    if (first === undefined) {
+      return '';
+    }
+    return typeof first === 'string' ? first : first.text;
   }
 
   forward(
@@ -802,6 +926,7 @@ export class LM extends BaseLM {
   readonly headers: Readonly<Record<string, string>>;
   readonly numRetries: number;
   readonly useDeveloperRole: boolean;
+  readonly forceVisionCapable: boolean | undefined;
 
   readonly #fetchImpl: typeof globalThis.fetch;
 
@@ -821,6 +946,7 @@ export class LM extends BaseLM {
     this.headers = Object.freeze({ ...(options.headers ?? {}) });
     this.numRetries = options.numRetries ?? 3;
     this.useDeveloperRole = options.useDeveloperRole ?? false;
+    this.forceVisionCapable = options.forceVisionCapable;
     this.#fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -828,6 +954,13 @@ export class LM extends BaseLM {
     const provider = providerNameFromModel(this.model);
     return (provider === 'openai' || provider === 'openrouter')
       && (this.modelType === 'chat' || this.modelType === 'responses');
+  }
+
+  override get supportsVision(): boolean {
+    if (this.forceVisionCapable !== undefined) {
+      return this.forceVisionCapable;
+    }
+    return modelMatchesVisionPattern(this.model);
   }
 
   override get supportsReasoning(): boolean {

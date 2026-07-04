@@ -1,5 +1,6 @@
 /**
- * Smoke-test the LongCoT uv bridge (no HF_TOKEN; no RLM calls).
+ * Smoke-test the LongCoT uv bridge (no HF_TOKEN).
+ * `--dry-run --runner rlm` exercises CLI wiring only (no LM / no `aforward`).
  */
 
 import { randomUUID } from 'node:crypto';
@@ -10,7 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-const LONGCOT_DIR = join(TEST_DIR, '..', 'tools', 'longcot');
+const REPO_ROOT = join(TEST_DIR, '..');
+const LONGCOT_DIR = join(REPO_ROOT, 'tools', 'longcot');
 
 describe('LongCoT uv bridge', () => {
   it('exports at least one question', () => {
@@ -73,5 +75,51 @@ describe('LongCoT uv bridge', () => {
     } finally {
       unlinkSync(jsonlPath);
     }
+  });
+
+  it('bench_longcot_rlm completes with --dry-run --runner rlm (no API, RLM path not executed)', () => {
+    const r = spawnSync(
+      'npx',
+      [
+        'tsx',
+        'tools/bench_longcot_rlm.ts',
+        '--dry-run',
+        '--runner',
+        'rlm',
+        '--domain',
+        'logic',
+        '--difficulty',
+        'easy',
+        '--max',
+        '1',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 },
+    );
+    expect(r.error, String(r.stderr)).toBeUndefined();
+    expect(r.status, `${r.stderr}\n${r.stdout}`).toBe(0);
+    expect(`${r.stderr}\n${r.stdout}`).toContain('runner=rlm');
+  });
+
+  it('compare_longcot_predict_rlm completes on --dry-run (no API)', () => {
+    const r = spawnSync(
+      'npx',
+      [
+        'tsx',
+        'tools/compare_longcot_predict_rlm.ts',
+        '--dry-run',
+        '--max',
+        '1',
+        '--domain',
+        'logic',
+        '--difficulty',
+        'easy',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 },
+    );
+    expect(r.error, String(r.stderr)).toBeUndefined();
+    expect(r.status, `${r.stderr}\n${r.stdout}`).toBe(0);
+    const summary = JSON.parse(r.stdout.trim()) as { compare?: string; predict?: { total: number } };
+    expect(summary.compare).toBe('predict_vs_rlm');
+    expect(summary.predict?.total).toBe(1);
   });
 });

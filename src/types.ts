@@ -20,6 +20,7 @@ export const TYPE_TAGS = [
   'optional',
   'union',
   'custom',
+  'image',
 ] as const;
 
 export type TypeTag = (typeof TYPE_TAGS)[number];

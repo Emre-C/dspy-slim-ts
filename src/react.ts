@@ -322,7 +322,14 @@ export class ReAct<
       new Map([['x', createField({ kind: 'output', name: 'x' })]]),
     );
 
-    return adapter.formatUserMessageContent(trajectorySignature, trajectory);
+    // Trajectory entries are always plain text — there is no Image
+    // input field in `trajectorySignature`, so the adapter takes the
+    // string path. The cast surfaces this invariant to TypeScript.
+    const formatted = adapter.formatUserMessageContent(trajectorySignature, trajectory);
+    if (typeof formatted !== 'string') {
+      throw new TypeError('ReAct trajectory should never produce multimodal content parts.');
+    }
+    return formatted;
   }
 
   private callWithPotentialTrajectoryTruncation(

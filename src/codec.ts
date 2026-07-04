@@ -91,6 +91,15 @@ export function coerceNumber(value: unknown, kind: 'int' | 'float'): number {
   return numeric;
 }
 
+/**
+ * Coerce an arbitrary value to a list or dict container. Passes through
+ * arrays/plain-objects after snapshotting. For strings, attempts
+ * `JSON.parse` and narrows the result; malformed JSON becomes a
+ * structured `ValueError` instead of leaking `SyntaxError` ("Unexpected
+ * end of JSON input" / "Unexpected token …") up through the adapter
+ * into the effect loop. Empty strings are rejected eagerly since
+ * `JSON.parse('')` throws on most runtimes.
+ */
 export function coerceJsonContainer(value: unknown, kind: 'list' | 'dict'): unknown {
   if (kind === 'list' && Array.isArray(value)) {
     return snapshotOwnedValue(value);
@@ -104,7 +113,18 @@ export function coerceJsonContainer(value: unknown, kind: 'list' | 'dict'): unkn
     throw new ValueError(`Cannot coerce ${String(value)} to ${kind}`);
   }
 
-  const parsed: unknown = JSON.parse(value);
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    throw new ValueError(`Cannot coerce empty string to ${kind}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new ValueError(`Cannot coerce ${String(value)} to ${kind}: ${detail}`);
+  }
 
   if (kind === 'list' && Array.isArray(parsed)) {
     return snapshotOwnedValue(parsed);
@@ -140,6 +160,7 @@ export function coerceFieldValue(typeTag: TypeTag, value: unknown): unknown {
     case 'optional':
     case 'union':
     case 'custom':
+    case 'image':
       return snapshotOwnedValue(value);
   }
 }

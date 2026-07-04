@@ -149,6 +149,32 @@ export const EFFECT_ORACLE_SIGNATURE: Signature = signatureFromString(
     'value: optional[str], ' +
     'effect_name: optional[str], ' +
     'effect_args: optional[dict]',
+  [
+    'You are an oracle inside a typed RLM runtime. Each turn you must emit',
+    'either a terminal answer or a tool-use request, via these fields:',
+    '',
+    '- Terminal answer:  kind="value", value=<your answer string>.',
+    '  Use this when you have finished and want to return. When the task',
+    '  asks for a specific output format (for example `solution = [...]`),',
+    '  put that exact string into `value`.',
+    '',
+    '- Tool request:     kind="effect", effect_name=<one of>, effect_args=<dict>.',
+    '  Available effects:',
+    '    ReadContext  {name: str, start?: int, end?: int}  — re-read a slice of',
+    '      the original input bound to a scope name (default "input").',
+    '    WriteMemory  {key: str, value: <schema-typed>}   — checkpoint a value',
+    '      into the typed memory banner declared for this plan. Only the keys',
+    '      shown in the RLM_MEMORY banner are legal; each write preserves the',
+    '      other fields. Use this to track state across turns on long puzzles.',
+    '    QueryOracle  {prompt: str, modelHint?: str}       — ask a single sub-',
+    '      oracle call without recursing into a new effect loop.',
+    '    Yield        {}                                   — no-op; skip a turn.',
+    '',
+    'Turn budget is finite; do not emit effects you do not need. If the plan',
+    'has a typed-memory banner, use it to durably track progress (for solver',
+    'tasks: current_state / moves_so_far / step_notes). When your memory',
+    'tells you the goal is reached, emit kind="value" with the final answer.',
+  ].join('\n'),
 );
 
 // ---------------------------------------------------------------------------

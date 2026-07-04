@@ -185,6 +185,7 @@ export class RLM<
   constructor(signature: TSig, options: RLMOptions = {}) {
     super();
     this.signature = ensureSignature(signature);
+    assertNoNativeImageInputs(this.signature);
     if (this.signature.outputFields.size === 0) {
       throw new ValueError(
         'RLM signature must declare at least one output field.',
@@ -509,6 +510,19 @@ function normalizeHandlers(
     out.set(handler.name, handler);
   }
   return out;
+}
+
+function assertNoNativeImageInputs(signature: Signature): void {
+  const imageInputs = [...signature.inputFields.values()]
+    .filter((field) => field.typeTag === 'image')
+    .map((field) => field.name);
+  if (imageInputs.length === 0) {
+    return;
+  }
+  throw new ConfigurationError(
+    `RLM does not support native Image input fields yet (${imageInputs.join(', ')}). `
+    + 'Use Predict for one-shot vision tasks, or wrap vision calls in RLM tools.',
+  );
 }
 
 /**

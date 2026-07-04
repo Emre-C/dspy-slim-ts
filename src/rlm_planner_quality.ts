@@ -45,6 +45,12 @@ export const DOCUMENTED_OPTIMAL_K: Readonly<Record<TaskType, number>> =
     pairwise: 2,
     multi_hop: 5,
     classify: 3,
+    // `solve` does not use `split`; any `k` yields an equivalent plan
+    // because no `vref('k')` appears in the template. We document the
+    // minimum legal value (2) so the planner's argmax stays strict and
+    // the generated plan allocates the smallest possible partition
+    // counter where one is required downstream.
+    solve: 2,
     unknown: 3,
   });
 
@@ -84,6 +90,11 @@ const CLASSIFY_PENALTY = 0.07;
 const UNKNOWN_SATURATION = 2;
 /** `unknown` curve: strongest penalty — fallback should never over-fan-out. */
 const UNKNOWN_PENALTY = 0.1;
+
+/** `solve` curve: decays monotonically with `k`. The plan does not
+ * use `split`, so `k` has no structural effect; we return a strictly
+ * decreasing curve to keep the argmax at the minimum legal value. */
+const SOLVE_DECAY = 0.1;
 
 /** Compile-time assertion that the configured penalties clear the strict margin. */
 void MIN_STRICT_MARGIN;
@@ -189,6 +200,15 @@ function qUnknown(k: number, n: number): number {
   return Math.max(0, (base - penalty) * nScale(n));
 }
 
+/**
+ * `solve`: structural `k` has no effect on the plan (no `split`
+ * anywhere), so this curve is a strict linear decay. The argmax is
+ * always `K_SEARCH_MIN = 2`, matching the documented optimum.
+ */
+function qSolve(k: number, n: number): number {
+  return Math.max(0, (1 - SOLVE_DECAY * (k - K_SEARCH_MIN)) * nScale(n));
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -202,5 +222,6 @@ export const QUALITY_CURVES: Readonly<Record<TaskType, QualityCurve>> =
     pairwise: qPairwise,
     multi_hop: qMultiHop,
     classify: qClassify,
+    solve: qSolve,
     unknown: qUnknown,
   });

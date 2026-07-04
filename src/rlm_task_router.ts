@@ -39,13 +39,19 @@ import type { RLMBudget } from './rlm_types.js';
 /**
  * Closed set of task families the planner and router know about.
  *
- * The six "real" entries mirror Table 1 of the λ-RLM paper:
+ * The seven "real" entries cover the task families the planner and router
+ * know how to serve:
  * - `search`     — locate a fact in a large chunked context.
  * - `classify`   — assign one of a small finite set of labels.
  * - `aggregate`  — combine per-chunk findings into a holistic answer.
  * - `pairwise`   — compare exactly two items; `k` is always 2.
  * - `summarise`  — compress a long input into a shorter output.
  * - `multi_hop`  — chain multiple reasoning steps across sub-findings.
+ * - `solve`      — iterative state-tracking reasoning on a single prompt:
+ *                 no chunking, one oracle leaf, long effect loop, typed
+ *                 memory. Use this for BlocksWorld, Sudoku, chess, any
+ *                 puzzle where state evolves sequentially and the prompt
+ *                 must NOT be split.
  *
  * `unknown` is the conservative fallback when the classifier can't
  * commit. `resolveRoute` maps `unknown` to the `summarise` plan (the
@@ -59,6 +65,7 @@ export type TaskType =
   | 'pairwise'
   | 'summarise'
   | 'multi_hop'
+  | 'solve'
   | 'unknown';
 
 const REAL_TASK_TYPES: readonly TaskType[] = Object.freeze([
@@ -68,6 +75,7 @@ const REAL_TASK_TYPES: readonly TaskType[] = Object.freeze([
   'pairwise',
   'summarise',
   'multi_hop',
+  'solve',
 ]);
 
 const ALL_TASK_TYPES: readonly TaskType[] = Object.freeze([
@@ -256,6 +264,55 @@ const FAILURE_DIAGNOSTIC_SCHEMA: MemorySchema = Object.freeze({
 });
 
 /**
+ * Memory schema for the `solve` plan.
+ *
+ * Long-horizon state-tracking tasks (BlocksWorld, Sudoku, chess, logic
+ * puzzles) are solved by a single oracle leaf iterating across many
+ * effect turns. The LM is expected to use `WriteMemory` to checkpoint
+ * three pieces of state between turns:
+ *
+ * - `current_state`: a faithful serialisation of the puzzle state
+ *   after the most recent move. Think "stacks as JSON" for
+ *   BlocksWorld, FEN for chess, a grid dump for Sudoku.
+ * - `moves_so_far`: an append-only log of the actions taken,
+ *   formatted the same way the final `solution = ...` answer will
+ *   be (so the LM can copy-paste when it's ready to terminate).
+ * - `step_notes`: free-form short notes — which invariants still hold,
+ *   what dead-ends were ruled out, what the next move is going to be.
+ *
+ * Fields are narrow enough that the injector banner stays readable
+ * even across dozens of effect turns; the per-field byte caps match
+ * the defaults for typed memory.
+ */
+const SOLVER_STATE_SCHEMA: MemorySchema = Object.freeze({
+  name: 'solver_state',
+  fields: Object.freeze([
+    Object.freeze({
+      name: 'current_state',
+      type: 'string' as const,
+      description:
+        'Serialised current state of the puzzle/environment after the last applied move.',
+      maxLength: 4096,
+    }),
+    Object.freeze({
+      name: 'moves_so_far',
+      type: 'string' as const,
+      description:
+        'Append-only log of applied moves in the final answer format (e.g. the literal solution = ... list body).',
+      maxLength: 8192,
+    }),
+    Object.freeze({
+      name: 'step_notes',
+      type: 'string' as const,
+      description:
+        'Short reasoning notes: invariants held, ruled-out dead-ends, next intended move.',
+      maxLength: 1024,
+    }),
+  ]),
+  maxBytesSerialized: DEFAULT_MAX_MEMORY_BYTES,
+});
+
+/**
  * Search: fan out per chunk, collect findings, return the concatenated
  * list. Quality rises monotonically with `k` up to the argmax at `k=8`.
  */
@@ -347,6 +404,23 @@ const MULTI_HOP_TEMPLATE: CombinatorNode = vote(
 );
 
 /**
+ * Solve: single oracle leaf on the **full, unsplit** input. The oracle
+ * runs through its effect loop — `WriteMemory` to track state,
+ * `ReadContext` to re-inspect the prompt when the turn-specific
+ * context is insufficient — until it emits a terminal `kind: 'value'`
+ * answer. There is no partitioning (`split` would destroy sequential
+ * state), no map/reduce fan-out, no self-consistency vote at the top
+ * level; quality comes entirely from the long-horizon effect loop
+ * driving `SOLVER_STATE_SCHEMA`.
+ *
+ * Callers who want multiple independent samples can still wrap a
+ * `solve` plan in `vote`/`ensemble` by supplying a custom
+ * `StaticPlan` through `RLMOptions.plans`; the default stays a pure
+ * single-call plan so the oracle sees the full problem exactly once.
+ */
+const SOLVE_TEMPLATE: CombinatorNode = oracle(vref('input'), MODEL_DEEP);
+
+/**
  * The six-entry static plan registry. `unknown` is intentionally
  * absent — `resolveRoute` maps it to `summarise` (see below).
  *
@@ -404,6 +478,14 @@ export const STATIC_PLANS: ReadonlyMap<TaskType, StaticPlan> = Object.freeze(
         memorySchema: FAILURE_DIAGNOSTIC_SCHEMA,
       },
     ],
+    [
+      'solve',
+      {
+        taskType: 'solve',
+        template: SOLVE_TEMPLATE,
+        memorySchema: SOLVER_STATE_SCHEMA,
+      },
+    ],
   ]),
 );
 
@@ -458,7 +540,7 @@ export async function classifyTask(
 
 const CLASSIFIER_SIGNATURE: Signature = signatureFromString(
   'context: str -> primary: str, confidence: float, candidates: list[str]',
-  'Classify the user request into one of: search, classify, aggregate, pairwise, summarise, multi_hop, or unknown. Return the top choice as `primary`, a confidence score in [0,1], and the full ranked candidate list.',
+  'Classify the user request into one of: search, classify, aggregate, pairwise, summarise, multi_hop, solve, or unknown. Use `solve` for iterative state-tracking puzzles (BlocksWorld, Sudoku, chess, logic puzzles) where the prompt describes a starting state and a goal and asks for a sequence of actions. Return the top choice as `primary`, a confidence score in [0,1], and the full ranked candidate list.',
 );
 
 const UNKNOWN_CLASSIFIER_RESULT: ClassifierResult = Object.freeze({

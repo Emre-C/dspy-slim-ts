@@ -212,3 +212,140 @@ describe('Adapter hardening', () => {
     expect(messages[3]?.content).not.toContain('history');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Optional output fields
+//
+// `optional[T]` output fields must be accepted when the LM omits them, must
+// be rejected in the normal 'missing required field' and 'unexpected field'
+// error paths, and must be announced to the LM in prompts so long-context
+// callers do not have to guess. These tests pin all three behaviors for
+// both `ChatAdapter` and `JSONAdapter`.
+// ---------------------------------------------------------------------------
+
+describe('Optional output fields', () => {
+  const effectOracleSig = signatureFromString(
+    'prompt: str -> ' +
+      'kind: literal["value", "effect"], ' +
+      'value: optional[str], ' +
+      'effect_name: optional[str], ' +
+      'effect_args: optional[dict]',
+  );
+
+  describe('ChatAdapter.parse', () => {
+    const adapter = new ChatAdapter();
+
+    it('accepts omitted trailing optional fields when required fields are present', () => {
+      const completion =
+        '[[ ## kind ## ]]\nvalue\n\n[[ ## value ## ]]\nhello\n\n[[ ## completed ## ]]';
+
+      const parsed = adapter.parse(effectOracleSig, completion);
+
+      expect(parsed).toEqual({ kind: 'value', value: 'hello' });
+    });
+
+    it('accepts all optional fields being omitted when only required is present', () => {
+      const completion = '[[ ## kind ## ]]\nvalue\n\n[[ ## completed ## ]]';
+
+      const parsed = adapter.parse(effectOracleSig, completion);
+
+      expect(parsed).toEqual({ kind: 'value' });
+    });
+
+    it('still throws when a required field is missing', () => {
+      const requiredSig = signatureFromString(
+        'question: str -> answer: str, score: float',
+      );
+      const completion = '[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]';
+
+      expect(() => adapter.parse(requiredSig, completion)).toThrowError(
+        AdapterParseError,
+      );
+    });
+
+    // NB: ChatAdapter intentionally ignores unknown `[[ ## ... ## ]]` headers
+    // (see the `ignores_unknown_headers` fixture). The cross-adapter contract
+    // is that the wire format is free to include extra sections. Declared
+    // fields still have to obey order, which is the next case.
+
+    it('rejects declared fields emitted out of declaration order', () => {
+      const completion =
+        '[[ ## value ## ]]\nhello\n\n[[ ## kind ## ]]\nvalue\n\n[[ ## completed ## ]]';
+
+      expect(() => adapter.parse(effectOracleSig, completion)).toThrowError(
+        AdapterParseError,
+      );
+    });
+  });
+
+  describe('JSONAdapter.parse', () => {
+    const adapter = new JSONAdapter();
+
+    it('accepts omitted optional fields in the JSON payload', () => {
+      const parsed = adapter.parse(
+        effectOracleSig,
+        '{"kind": "value", "value": "hello"}',
+      );
+
+      expect(parsed).toEqual({ kind: 'value', value: 'hello' });
+    });
+
+    it('coerces a present optional value through its inner TypeTag', () => {
+      const sig = signatureFromString('q: str -> count: optional[int]');
+
+      const parsed = adapter.parse(sig, '{"count": "42"}');
+
+      expect(parsed).toEqual({ count: 42 });
+    });
+
+    it('still throws when a required JSON field is missing', () => {
+      const requiredSig = signatureFromString('q: str -> answer: str, score: float');
+
+      expect(() => adapter.parse(requiredSig, '{"answer": "Paris"}')).toThrowError(
+        AdapterParseError,
+      );
+    });
+  });
+
+  describe('Prompt formatting', () => {
+    it('ChatAdapter marks optional fields in the system-message structure block', () => {
+      const adapter = new ChatAdapter();
+      const system = adapter.formatSystemMessage(effectOracleSig);
+
+      // Structure block placeholder carries the `(optional)` marker so the
+      // LM can tell required fields from omittable ones at a glance.
+      expect(system).toContain('<string (optional)>');
+      expect(system).toContain('<object (optional)>');
+      // Required literal field is still rendered without the optional marker.
+      expect(system).toContain('[[ ## kind ## ]]');
+    });
+
+    it('ChatAdapter announces optional output names in the user-message requirements', () => {
+      const adapter = new ChatAdapter();
+      const messages = adapter.format(effectOracleSig, [], { prompt: 'hi' });
+      const lastUser = messages.at(-1)?.content as string;
+
+      expect(lastUser).toContain('`value`');
+      expect(lastUser).toContain('`effect_name`');
+      expect(lastUser).toContain('`effect_args`');
+      expect(lastUser).toContain('optional and may be omitted');
+    });
+
+    it('JSONAdapter announces optional fields in its user-message requirements', () => {
+      const adapter = new JSONAdapter();
+      const messages = adapter.format(effectOracleSig, [], { prompt: 'hi' });
+      const lastUser = messages.at(-1)?.content as string;
+
+      expect(lastUser).toContain('optional and may be omitted');
+    });
+
+    it('describeField annotates optional fields with the inner type and "optional"', () => {
+      const adapter = new ChatAdapter();
+      const system = adapter.formatSystemMessage(effectOracleSig);
+
+      // `describeField` lines live in the "Your output fields are:" section.
+      expect(system).toMatch(/`value` \(str, optional\)/);
+      expect(system).toMatch(/`effect_args` \(dict, optional\)/);
+    });
+  });
+});

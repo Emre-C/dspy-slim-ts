@@ -31,6 +31,7 @@
     "bench:longcot": "npx tsx tools/bench_longcot_rlm.ts",
     "bench:longcot:preflight": "npx tsx tools/bench_longcot_rlm.ts --preflight",
     "bench:longcot:smoke": "npx tsx tools/bench_longcot_rlm.ts --smoke",
+    "bench:longcot:compare": "npx tsx tools/compare_longcot_predict_rlm.ts",
     "bench:rlm-v2": "npx tsx tools/record_rlm_v2.ts --verify",
     "record:rlm-v2": "npx tsx tools/record_rlm_v2.ts",
     "smoke:consumer": "bash tools/consumer_smoke.sh"
